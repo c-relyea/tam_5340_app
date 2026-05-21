@@ -1,0 +1,15 @@
+/*
+ * Copyright (c) 2024 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/*
+ * The USB-C port on this board is power/charge only — the D+/D- lines are
+ * not routed to the nRF5340.  Disable the USB device controller so the USB
+ * audio stack does not waste RAM and does not assert the D+ pull-up on an
+ * unconnected pin.
+ */
+&zephyr_udc0 {
+	status = "disabled";
+};

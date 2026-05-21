@@ -1,4 +1,4 @@
-###Build and flash
+### Build and flash
 ```
 west build -b tam_board/nrf5340/cpuapp --sysbuild -- -DCONFIG_AUDIO_DEV=2
 ```
@@ -7,7 +7,7 @@ west flash --runner jlink
 ```
 
 
-###RTT Logs
+### RTT Logs
 
 In one terminal:
 ```
@@ -21,7 +21,7 @@ tail -f /tmp/rtt_log.txt
 
 
 
-###Troubleshooting
+### Troubleshooting
 
 Sometimes the network core is protected and refuses to flash. Try:
 ```

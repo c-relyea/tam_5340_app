@@ -59,21 +59,26 @@ const uint32_t pdm_mic_enable_configure[][2] = {
 	{ CS47L63_MICBIAS_CTRL1, 0x00EC },
 	{ CS47L63_MICBIAS_CTRL5, 0x0272 },
 
-	/* Enable IN1L */
+	/* Enable all inputs */
 	{ CS47L63_INPUT_CONTROL, 0x000F },
 
-	/* Enable PDM mic as digital input */
+	/* Configure IN1 (Pod 1: trachea=IN1L, ambient=IN1R) and IN2 (Pod 2: trachea=IN2L) as PDM */
 	{ CS47L63_INPUT1_CONTROL1, 0x50021 },
+	{ CS47L63_INPUT2_CONTROL1, 0x50021 },
 
 	/* Un-mute and set gain to 0dB */
 	{ CS47L63_IN1L_CONTROL2, 0x800080 },
 	{ CS47L63_IN1R_CONTROL2, 0x800080 },
+	{ CS47L63_IN2L_CONTROL2, 0x800080 },
 
 	/* Volume Update */
 	{ CS47L63_INPUT_CONTROL3, 0x20000000 },
 
-	/* Send PDM MIC to I2S Tx */
+	/* BIS 1 (left): sum Pod 1 trachea (IN1L) + Pod 2 trachea (IN2L) */
 	{ CS47L63_ASP1TX1_INPUT1, 0x800010 },
+	{ CS47L63_ASP1TX1_INPUT2, 0x800012 },
+
+	/* BIS 2 (right): Pod 1 ambient (IN1R) */
 	{ CS47L63_ASP1TX2_INPUT1, 0x800011 },
 };
 

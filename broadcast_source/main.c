@@ -10,6 +10,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/zbus/zbus.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/sensor.h>
+
 
 #include "broadcast_source.h"
 #include "zbus_common.h"
@@ -22,6 +25,16 @@
 #include "fw_info_app.h"
 
 #include <zephyr/logging/log.h>
+
+#define SENSOR_ADDR 0x57
+
+/* BQ27427 fuel gauge — I2C addr 0x55, standard command set */
+#define BQ27427_ADDR     0x55
+#define BQ27427_REG_SOC  0x1C  /* State of Charge, 2-byte LE, units: %  */
+#define BQ27427_REG_VOLT 0x04  /* Voltage,          2-byte LE, units: mV */
+
+
+
 LOG_MODULE_REGISTER(main, CONFIG_MAIN_LOG_LEVEL);
 
 ZBUS_SUBSCRIBER_DEFINE(button_evt_sub, CONFIG_BUTTON_MSG_SUB_QUEUE_SIZE);
@@ -209,14 +222,6 @@ static void le_audio_msg_sub_thread(void)
 			ret = led_blink(LED_APP_1_BLUE);
 			ERR_CHK(ret);
 
-			if (IS_ENABLED(CONFIG_AUDIO_TEST_TONE)) {
-				ret = audio_system_encode_test_tone_set(1000);
-				if (ret) {
-					LOG_WRN("Failed to auto-start test tone: %d", ret);
-				} else {
-					LOG_INF("Test tone auto-started at 1000 Hz");
-				}
-			}
 
 			break;
 
@@ -557,8 +562,185 @@ static void broadcast_create(struct broadcast_source_big *broadcast_param)
 }
 #endif /* CONFIG_CUSTOM_BROADCASTER */
 
-int main(void)
+
+/* -------------------------------------------------------------------------
+ * IMU thread — LSM6DSV16X accelerometer + gyroscope at 50 Hz
+ * -------------------------------------------------------------------------
+ */
+static void polling_thread_imu(void)
 {
+	const struct device *imu_dev = DEVICE_DT_GET(DT_NODELABEL(imu));
+
+	if (!device_is_ready(imu_dev)) {
+		printk("IMU not ready!\n");
+		return;
+	}
+	printk("IMU ready!\n");
+
+	struct sensor_value accel[3], gyro[3];
+
+	while (1) {
+		int ret = sensor_sample_fetch(imu_dev);
+
+		if (ret) {
+			printk("IMU fetch error: %d\n", ret);
+			k_msleep(20);
+			continue;
+		}
+
+		sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_XYZ, accel);
+		sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_XYZ, gyro);
+
+		/* val1 = integer part, val2 = fractional part in millionths */
+		printk("Accel [m/s2]: X=%d.%06d Y=%d.%06d Z=%d.%06d\n",
+		       accel[0].val1, abs(accel[0].val2),
+		       accel[1].val1, abs(accel[1].val2),
+		       accel[2].val1, abs(accel[2].val2));
+		printk("Gyro [rad/s]: X=%d.%06d Y=%d.%06d Z=%d.%06d\n",
+		       gyro[0].val1, abs(gyro[0].val2),
+		       gyro[1].val1, abs(gyro[1].val2),
+		       gyro[2].val1, abs(gyro[2].val2));
+
+		k_msleep(20); /* 50 Hz */
+	}
+}
+
+K_THREAD_DEFINE(imu_thread_id, 2048, polling_thread_imu, NULL, NULL, NULL, 5, 0, 0);
+
+/* -------------------------------------------------------------------------
+ * Battery thread — BQ27427 state-of-charge every 10 s
+ * -------------------------------------------------------------------------
+ */
+static void polling_thread_battery(void)
+{
+	const struct device *i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
+
+	if (!device_is_ready(i2c_dev)) {
+		printk("Battery gauge I2C not ready!\n");
+		return;
+	}
+	printk("Battery gauge ready!\n");
+
+	while (1) {
+		uint8_t buf[2];
+		int ret;
+
+		ret = i2c_burst_read(i2c_dev, BQ27427_ADDR, BQ27427_REG_SOC, buf, 2);
+		if (ret) {
+			printk("Battery SOC read error: %d\n", ret);
+		} else {
+			uint16_t soc = buf[0] | ((uint16_t)buf[1] << 8); /* little-endian */
+			printk("Battery: %d%%\n", soc);
+		}
+
+		k_msleep(10000); /* every 10 s — SOC changes slowly */
+	}
+}
+
+K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NULL, 6, 0, 0);
+
+/* -------------------------------------------------------------------------
+ * SpO2 / PPG thread — MAX30101 raw FIFO at ~100 Hz
+ * -------------------------------------------------------------------------
+ */
+void polling_thread_spo2(void)
+{
+    const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
+    if (!device_is_ready(pulse_dev)) {
+        printk("SpO2 device not ready!\n");
+        return;
+    }
+
+    uint8_t fifo[9];   // 9 bytes per sample
+
+    while (1) {
+        /* READ A FULL RED+IR+GREEN FIFO ENTRY */
+        int ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x07, fifo, 9);
+        if (ret) {
+            printk("FIFO read error %d\n", ret);
+            k_msleep(10);
+            continue;
+        }
+
+        uint32_t red   = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
+        uint32_t ir    = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
+        uint32_t green = ((fifo[6] << 16) | (fifo[7] << 8) | fifo[8]) & 0x3FFFF;
+
+		printk("RED: %d, IR: %d, GREEN: %d\n", red, ir, green);
+
+        // /* Package into struct */
+        // struct ppg_sample sample = {
+        //     .red   = red,
+        //     .ir    = ir,
+        //     .green = green
+        // };
+
+        /* ============================
+        //      SEND OVER BLUETOOTH
+        //    ============================ */
+        // if (spo2_notify_enabled && current_conn) {
+
+        //     /* Packet layout: 12 bytes
+        //        [0-3] = RED
+        //        [4-7] = IR
+        //        [8-11] = GREEN
+        //     */
+
+        //     uint32_t pkt[3] = { red, ir, green };
+
+        //     bt_gatt_notify(current_conn, 
+        //                    &audio_svc.attrs[5],   // your SpO2 characteristic
+        //                    pkt, sizeof(pkt));
+        // }
+
+        k_msleep(100);  // ~100Hz sensor rate
+    }
+}
+
+K_THREAD_DEFINE(spo2_thread_id, 2048, polling_thread_spo2,
+                NULL, NULL, NULL, 5, 0, 0);  // Priority 5 (medium)
+
+
+int main(void)
+
+
+
+{
+	const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
+    if (!device_is_ready(pulse_dev)) {
+            printk("Pulse oximeter not ready!\n");
+            return;         
+    } else {
+            printk("Pulse oximeter ready!\n");
+    }
+        printk("Configuring pulse oximeter...\n");
+
+        // FIFO config
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x08, 0x4F); // avg=4, rollover
+
+        // SpO2 config: gain, sample rate 100Hz, pulse width 411 µs
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0A, 0x4F);
+
+        // LED currents
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0C, 0x50); // RED
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0D, 0x80); // IR
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0E, 0x80); // GREEN
+
+        // *** MULTI-LED SLOTS (THIS WAS MISSING!) ***
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x11, 0x21); // slot1=RED, slot2=IR
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x12, 0x03); // slot3=GREEN
+
+        // Clear FIFO
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x04, 0x00);
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x05, 0x00);
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x06, 0x00);
+
+        // Enable multi-LED mode (RED+IR+GREEN)
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x09, 0x07);
+
+
+    printk("Pulse oximeter configured!\n");
+
 	int ret;
 	static struct broadcast_source_big broadcast_param;
 

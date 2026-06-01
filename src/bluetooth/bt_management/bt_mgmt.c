@@ -146,10 +146,14 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 	ret = zbus_chan_pub(&bt_mgmt_chan, &msg, K_NO_WAIT);
 	ERR_CHK(ret);
 
-	if (IS_ENABLED(CONFIG_BT_PERIPHERAL)) {
-		ret = bt_mgmt_adv_start(0, NULL, 0, NULL, 0, true);
-		ERR_CHK(ret);
-	}
+	/* NOTE: bt_mgmt_adv_start is intentionally NOT called here for the
+	 * broadcast-source role.  The BIS extended advertising set (handle 0)
+	 * is permanently active while the BIG is running; calling
+	 * bt_mgmt_adv_start on an ACL (NUS) disconnect tries to reconfigure
+	 * the periodic advertising while the BIG is still up, which the
+	 * controller rejects (0x0c Command Disallowed) and leaves the ext_adv
+	 * handle in a half-modified state that breaks the next ACL connection.
+	 */
 
 	/* The mutex for preventing the racing condition if two headset disconnected too close,
 	 * cause the disconnected_cb() triggered in short time leads to duplicate scanning

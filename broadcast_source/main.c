@@ -11,7 +11,6 @@
 #include <zephyr/zbus/zbus.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/drivers/i2c.h>
-#include <zephyr/drivers/sensor.h>
 
 
 #include "broadcast_source.h"
@@ -25,6 +24,8 @@
 #include "fw_info_app.h"
 
 #include <zephyr/logging/log.h>
+#include <bluetooth/services/nus.h>
+#include <string.h>
 
 #define SENSOR_ADDR 0x57
 
@@ -32,6 +33,15 @@
 #define BQ27427_ADDR     0x55
 #define BQ27427_REG_SOC  0x1C  /* State of Charge, 2-byte LE, units: %  */
 #define BQ27427_REG_VOLT 0x04  /* Voltage,          2-byte LE, units: mV */
+
+/* LSM6DSV16X IMU — I2C addr 0x6A */
+#define LSM6DSV16X_ADDR         0x6A
+#define LSM6DSV16X_REG_WHO_AM_I 0x0F  /* Should read 0x71                       */
+#define LSM6DSV16X_REG_CTRL1    0x10  /* Accel: op_mode_xl[6:4] odr_xl[3:0]     */
+#define LSM6DSV16X_REG_CTRL2    0x11  /* Gyro:  op_mode_g[6:4]  odr_g[3:0]      */
+#define LSM6DSV16X_REG_CTRL3    0x12  /* boot[7] bdu[6] if_inc[2] sw_reset[0]   */
+#define LSM6DSV16X_REG_OUTX_L_G 0x22  /* Gyro XYZ then Accel XYZ — 12 bytes    */
+#define LSM6DSV16X_WHOAMI       0x71
 
 
 
@@ -330,6 +340,115 @@ static void bt_mgmt_evt_handler(const struct zbus_channel *chan)
 
 ZBUS_LISTENER_DEFINE(bt_mgmt_evt_listen, bt_mgmt_evt_handler);
 
+/* -------------------------------------------------------------------------
+ * NUS (Nordic UART Service) — sensor data to connected BLE central
+ * -------------------------------------------------------------------------
+ */
+static struct bt_conn *nus_conn;
+static bool nus_notify_enabled; /* set when central writes CCCD = 0x0001 */
+
+static const struct bt_data nus_ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+};
+
+/**
+ * @brief  Send a NUL-terminated ASCII string over NUS.
+ *         No-op until the central has subscribed (written CCCD = 0x0001),
+ *         which only happens after GATT service discovery is complete.
+ *         Sending before that would compete with ATT discovery traffic.
+ */
+static void nus_send_str(const char *str)
+{
+	if (!nus_conn || !nus_notify_enabled) {
+		return;
+	}
+	int ret = bt_nus_send(nus_conn, (const uint8_t *)str, strlen(str));
+
+	if (ret && ret != -ENOTCONN) {
+		LOG_WRN("NUS send failed: %d", ret);
+	}
+}
+
+static void nus_send_enabled_cb(enum bt_nus_send_status status)
+{
+	nus_notify_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
+	LOG_INF("NUS notifications %s",
+		nus_notify_enabled ? "enabled — streaming" : "disabled");
+}
+
+static const struct bt_nus_cb nus_callbacks = {
+	.send_enabled = nus_send_enabled_cb,
+};
+
+/* Delayed work to restart NUS advertising after disconnect.
+ * A 500 ms delay lets bt_mgmt finish restarting BIS extended advertising
+ * before we call bt_le_adv_start(), avoiding -EACCES (-13) collisions.
+ */
+static struct k_work_delayable nus_adv_restart_work;
+
+static void nus_adv_restart_handler(struct k_work *work)
+{
+	/* Always stop first to tear down any stale advertising handle left
+	 * by a previous connection or a 0x28 (Instant Passed) disconnect.
+	 * Without this, bt_le_adv_start returns -EALREADY (handle appears
+	 * running) but the handle is actually invalid, and the next connection
+	 * attempt triggers "No valid adv" inside Zephyr's connection setup.
+	 */
+	(void)bt_le_adv_stop();
+
+	int ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, nus_ad, ARRAY_SIZE(nus_ad), NULL, 0);
+
+	if (ret == 0) {
+		LOG_INF("NUS advertising restarted");
+	} else {
+		LOG_WRN("NUS adv restart failed: %d", ret);
+	}
+}
+
+static void nus_start_advertising(void)
+{
+	/* 2 s delay: bt_mgmt needs ~1 s to finish attempting its own BIS adv
+	 * restart after an ACL disconnect before bt_le_adv_start is safe to call.
+	 */
+	k_work_schedule(&nus_adv_restart_work, K_MSEC(2000));
+}
+
+/* Accept all LL connection parameter update requests from the central.
+ * Without this the host rejects updates that conflict with BIS ISO scheduling,
+ * causing the controller to time out and disconnect with reason 0x28
+ * ("Instant Passed").
+ */
+static bool ble_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
+{
+	return true;
+}
+
+static void ble_connected(struct bt_conn *conn, uint8_t err)
+{
+	if (!err) {
+		nus_conn = bt_conn_ref(conn);
+		LOG_INF("BLE central connected");
+	}
+}
+
+static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	if (nus_conn) {
+		bt_conn_unref(nus_conn);
+		nus_conn = NULL;
+	}
+	nus_notify_enabled = false;
+	LOG_INF("BLE central disconnected (reason %d)", reason);
+	nus_start_advertising();
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected    = ble_connected,
+	.disconnected = ble_disconnected,
+	.le_param_req = ble_le_param_req,
+};
+
 /**
  * @brief	Link zbus producers and observers.
  *
@@ -564,48 +683,89 @@ static void broadcast_create(struct broadcast_source_big *broadcast_param)
 
 
 /* -------------------------------------------------------------------------
- * IMU thread — LSM6DSV16X accelerometer + gyroscope at 50 Hz
+ * IMU thread — LSM6DSV16X raw I2C, accel + gyro at 50 Hz
+ *
+ * Delays 2 s at startup so PWR_EN rails have time to stabilize and
+ * main() has time to run before we touch the I2C bus.
+ *
+ * Raw values:
+ *   Accel sensitivity  0.061 mg/LSB  (±2 g range)
+ *   Gyro  sensitivity  4.375 mdps/LSB (±125 dps range)
  * -------------------------------------------------------------------------
  */
 static void polling_thread_imu(void)
 {
-	const struct device *imu_dev = DEVICE_DT_GET(DT_NODELABEL(imu));
+	/* Let power rails stabilize and main() run first */
+	k_msleep(2000);
 
-	if (!device_is_ready(imu_dev)) {
-		printk("IMU not ready!\n");
+	const struct device *i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
+
+	if (!device_is_ready(i2c_dev)) {
+		printk("IMU: I2C not ready\n");
 		return;
 	}
-	printk("IMU ready!\n");
 
-	struct sensor_value accel[3], gyro[3];
+	/* Verify WHO_AM_I */
+	uint8_t who_am_i = 0;
+	int ret = i2c_reg_read_byte(i2c_dev, LSM6DSV16X_ADDR,
+				    LSM6DSV16X_REG_WHO_AM_I, &who_am_i);
+
+	if (ret || who_am_i != LSM6DSV16X_WHOAMI) {
+		printk("IMU not found (WHO_AM_I=0x%02X, err=%d)\n", who_am_i, ret);
+		return;
+	}
+
+	/* CTRL3: BDU=1 (bit6), IF_INC=1 (bit2) — required for coherent burst reads */
+	i2c_reg_write_byte(i2c_dev, LSM6DSV16X_ADDR, LSM6DSV16X_REG_CTRL3, 0x44);
+	/* Accel: HP mode (op_mode=000), 60 Hz (odr=0101) → bits[6:4]=000 bits[3:0]=0101 → 0x05 */
+	i2c_reg_write_byte(i2c_dev, LSM6DSV16X_ADDR, LSM6DSV16X_REG_CTRL1, 0x05);
+	/* Gyro:  HP mode (op_mode=000), 60 Hz (odr=0101) → 0x05 */
+	i2c_reg_write_byte(i2c_dev, LSM6DSV16X_ADDR, LSM6DSV16X_REG_CTRL2, 0x05);
+	/* Wait one ODR period for first sample to be ready (~17 ms at 60 Hz) */
+	k_msleep(20);
+
+	printk("IMU ready (WHO_AM_I=0x%02X)\n", who_am_i);
+
+	uint8_t raw[12];
 
 	while (1) {
-		int ret = sensor_sample_fetch(imu_dev);
-
+		/* Burst-read gyro XYZ + accel XYZ (12 bytes from 0x22) */
+		ret = i2c_burst_read(i2c_dev, LSM6DSV16X_ADDR,
+				     LSM6DSV16X_REG_OUTX_L_G, raw, sizeof(raw));
 		if (ret) {
-			printk("IMU fetch error: %d\n", ret);
-			k_msleep(20);
+			printk("IMU read error: %d\n", ret);
+			k_msleep(40);
 			continue;
 		}
 
-		sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_XYZ, accel);
-		sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_XYZ, gyro);
+		int16_t gx = (int16_t)((raw[1]  << 8) | raw[0]);
+		int16_t gy = (int16_t)((raw[3]  << 8) | raw[2]);
+		int16_t gz = (int16_t)((raw[5]  << 8) | raw[4]);
+		int16_t ax = (int16_t)((raw[7]  << 8) | raw[6]);
+		int16_t ay = (int16_t)((raw[9]  << 8) | raw[8]);
+		int16_t az = (int16_t)((raw[11] << 8) | raw[10]);
 
-		/* val1 = integer part, val2 = fractional part in millionths */
-		printk("Accel [m/s2]: X=%d.%06d Y=%d.%06d Z=%d.%06d\n",
-		       accel[0].val1, abs(accel[0].val2),
-		       accel[1].val1, abs(accel[1].val2),
-		       accel[2].val1, abs(accel[2].val2));
-		printk("Gyro [rad/s]: X=%d.%06d Y=%d.%06d Z=%d.%06d\n",
-		       gyro[0].val1, abs(gyro[0].val2),
-		       gyro[1].val1, abs(gyro[1].val2),
-		       gyro[2].val1, abs(gyro[2].val2));
+		/* Send every sample at 25 Hz.
+		 * Values ÷ 100 to fit in the 20-byte ATT payload:
+		 *   Accel: 1 unit = 6.1 mg    (0.061 mg/LSB × 100)
+		 *   Gyro:  1 unit = 437.5 mdps (4.375 mdps/LSB × 100)
+		 * Worst-case: "A:-327,-327,-327\n" = 17 bytes < 20 bytes.
+		 */
+		char buf[24];
 
-		k_msleep(20); /* 50 Hz */
+		snprintk(buf, sizeof(buf), "A:%d,%d,%d\n",
+			 ax / 100, ay / 100, az / 100);
+		nus_send_str(buf);
+
+		snprintk(buf, sizeof(buf), "G:%d,%d,%d\n",
+			 gx / 100, gy / 100, gz / 100);
+		nus_send_str(buf);
+
+		k_msleep(40); /* 25 Hz */
 	}
 }
 
-K_THREAD_DEFINE(imu_thread_id, 2048, polling_thread_imu, NULL, NULL, NULL, 5, 0, 0);
+K_THREAD_DEFINE(imu_thread_id, 1536, polling_thread_imu, NULL, NULL, NULL, 12, 0, 0);
 
 /* -------------------------------------------------------------------------
  * Battery thread — BQ27427 state-of-charge every 10 s
@@ -630,14 +790,18 @@ static void polling_thread_battery(void)
 			printk("Battery SOC read error: %d\n", ret);
 		} else {
 			uint16_t soc = buf[0] | ((uint16_t)buf[1] << 8); /* little-endian */
-			printk("Battery: %d%%\n", soc);
+			char nbuf[16];
+
+			snprintk(nbuf, sizeof(nbuf), "B:%d%%\n", soc);
+			printk("%s", nbuf);
+			nus_send_str(nbuf);
 		}
 
 		k_msleep(10000); /* every 10 s — SOC changes slowly */
 	}
 }
 
-K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NULL, 13, 0, 0);
 
 /* -------------------------------------------------------------------------
  * SpO2 / PPG thread — MAX30101 raw FIFO at ~100 Hz
@@ -645,20 +809,23 @@ K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NUL
  */
 void polling_thread_spo2(void)
 {
+    /* Wait for main() to configure the MAX30101 before reading */
+    k_msleep(2000);
+
     const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
     if (!device_is_ready(pulse_dev)) {
         printk("SpO2 device not ready!\n");
         return;
     }
 
-    uint8_t fifo[9];   // 9 bytes per sample
+    uint8_t fifo[9]; /* 3 bytes each: red, ir, green */
 
     while (1) {
-        /* READ A FULL RED+IR+GREEN FIFO ENTRY */
+        /* Read one FIFO entry (rollover keeps it fresh) */
         int ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x07, fifo, 9);
         if (ret) {
             printk("FIFO read error %d\n", ret);
-            k_msleep(10);
+            k_msleep(40);
             continue;
         }
 
@@ -666,39 +833,23 @@ void polling_thread_spo2(void)
         uint32_t ir    = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
         uint32_t green = ((fifo[6] << 16) | (fifo[7] << 8) | fifo[8]) & 0x3FFFF;
 
-		printk("RED: %d, IR: %d, GREEN: %d\n", red, ir, green);
+        /* Send every sample at 25 Hz.
+         * Right-shift 2 bits (÷4) so worst-case 18-bit values fit in 20-byte
+         * ATT payload: "P:65535,65535,65535\n" = 20 bytes exactly.
+         * Receiver multiplies by 4 to recover approximate ADC counts.
+         */
+        char pbuf[24];
 
-        // /* Package into struct */
-        // struct ppg_sample sample = {
-        //     .red   = red,
-        //     .ir    = ir,
-        //     .green = green
-        // };
+        snprintk(pbuf, sizeof(pbuf), "P:%u,%u,%u\n",
+                 red >> 2, ir >> 2, green >> 2);
+        nus_send_str(pbuf);
 
-        /* ============================
-        //      SEND OVER BLUETOOTH
-        //    ============================ */
-        // if (spo2_notify_enabled && current_conn) {
-
-        //     /* Packet layout: 12 bytes
-        //        [0-3] = RED
-        //        [4-7] = IR
-        //        [8-11] = GREEN
-        //     */
-
-        //     uint32_t pkt[3] = { red, ir, green };
-
-        //     bt_gatt_notify(current_conn, 
-        //                    &audio_svc.attrs[5],   // your SpO2 characteristic
-        //                    pkt, sizeof(pkt));
-        // }
-
-        k_msleep(100);  // ~100Hz sensor rate
+        k_msleep(40); /* 25 Hz */
     }
 }
 
 K_THREAD_DEFINE(spo2_thread_id, 2048, polling_thread_spo2,
-                NULL, NULL, NULL, 5, 0, 0);  // Priority 5 (medium)
+                NULL, NULL, NULL, 12, 0, 0);
 
 
 int main(void)
@@ -721,10 +872,15 @@ int main(void)
         // SpO2 config: gain, sample rate 100Hz, pulse width 411 µs
         i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0A, 0x4F);
 
-        // LED currents
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0C, 0x50); // RED
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0D, 0x80); // IR
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0E, 0x80); // GREEN
+        /* LED currents: each LSB = 0.2 mA.
+         * RED   0x50 = 80  × 0.2 mA = 16.0 mA  (unchanged — good mid-range level)
+         * IR    0x30 = 48  × 0.2 mA =  9.6 mA  (was 0x80 = 25.6 mA — was saturating ADC)
+         * GREEN 0x30 = 48  × 0.2 mA =  9.6 mA  (was 0x80 = 25.6 mA)
+         * Target: all channels at 40–70 % of 18-bit ADC full scale with finger contact.
+         * Tune 0x0C/0x0D/0x0E up or down if any channel still clips or is too dim. */
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0C, 0x50); // RED   16.0 mA
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0D, 0x30); // IR     9.6 mA
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0E, 0x30); // GREEN  9.6 mA
 
         // *** MULTI-LED SLOTS (THIS WAS MISSING!) ***
         i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x11, 0x21); // slot1=RED, slot2=IR
@@ -792,6 +948,22 @@ int main(void)
 	ERR_CHK_MSG(ret, "Failed to start first advertiser");
 
 	LOG_INF("Broadcast source: %s started", CONFIG_BT_AUDIO_BROADCAST_NAME);
+
+	ret = bt_nus_init(&nus_callbacks);
+	if (ret) {
+		LOG_ERR("Failed to init NUS: %d", ret);
+		return ret;
+	}
+
+	k_work_init_delayable(&nus_adv_restart_work, nus_adv_restart_handler);
+
+	/* Start NUS advertising immediately at boot (no BIS restart conflict yet) */
+	int adv_ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, nus_ad, ARRAY_SIZE(nus_ad), NULL, 0);
+
+	if (adv_ret && adv_ret != -EALREADY) {
+		LOG_WRN("NUS adv start failed: %d", adv_ret);
+	}
+	LOG_INF("NUS advertising started — connect as %s", CONFIG_BT_DEVICE_NAME);
 
 	return 0;
 }

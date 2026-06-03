@@ -182,12 +182,17 @@ static void button_msg_sub_thread(void)
 					break;
 				}
 
-				ret = audio_system_encode_test_tone_step();
-				if (ret) {
-					LOG_WRN("Failed to play test tone, ret: %d", ret);
-				}
+				static bool test_tone_active;
 
-				break;
+				test_tone_active = !test_tone_active;
+				ret = audio_system_encode_test_tone_set(
+					test_tone_active ? 1000 : 0);
+				if (ret) {
+					LOG_WRN("Failed to set test tone, ret: %d", ret);
+				} else {
+					LOG_INF("Test tone %s",
+						test_tone_active ? "ON (1 kHz)" : "OFF");
+				}
 			}
 
 			break;

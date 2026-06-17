@@ -24,7 +24,6 @@
 #include "fw_info_app.h"
 
 #include <zephyr/logging/log.h>
-#include <bluetooth/services/nus.h>
 #include <string.h>
 
 #define SENSOR_ADDR 0x57
@@ -177,22 +176,24 @@ static void button_msg_sub_thread(void)
 
 		case BUTTON_4:
 			if (IS_ENABLED(CONFIG_AUDIO_TEST_TONE)) {
+				static bool test_tone_active;
+
 				if (strm_state != STATE_STREAMING) {
 					LOG_WRN("Not in streaming state");
 					break;
 				}
 
-				static bool test_tone_active;
-
 				test_tone_active = !test_tone_active;
 				ret = audio_system_encode_test_tone_set(
 					test_tone_active ? 1000 : 0);
 				if (ret) {
-					LOG_WRN("Failed to set test tone, ret: %d", ret);
+					LOG_WRN("Failed to set test tone: %d", ret);
 				} else {
 					LOG_INF("Test tone %s",
 						test_tone_active ? "ON (1 kHz)" : "OFF");
 				}
+
+				break;
 			}
 
 			break;
@@ -346,113 +347,78 @@ static void bt_mgmt_evt_handler(const struct zbus_channel *chan)
 ZBUS_LISTENER_DEFINE(bt_mgmt_evt_listen, bt_mgmt_evt_handler);
 
 /* -------------------------------------------------------------------------
- * NUS (Nordic UART Service) — sensor data to connected BLE central
+ * Non-connectable sensor beacon — HR / SpO2 / battery in manufacturer data
+ *
+ * ADV_NONCONN_IND at ~1 s interval.  No ACL connection = zero scheduling
+ * conflict with BIS ISO events on the shared nRF5340 radio.
+ *
+ * Payload (company ID 0xFFFF, 4 data bytes):
+ *   [0]  hr_bpm    (0 = not yet computed)
+ *   [1]  spo2_int  integer part of SpO2 %  (0 = not yet computed)
+ *   [2]  spo2_frac fractional part × 10    (e.g. 5 → .5 %)
+ *   [3]  bat_pct   battery %               (0xFF = not yet read)
  * -------------------------------------------------------------------------
  */
-static struct bt_conn *nus_conn;
-static bool nus_notify_enabled; /* set when central writes CCCD = 0x0001 */
+#define SENSOR_COMPANY_ID  0xFFFF
 
-static const struct bt_data nus_ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+/* Payload: 2-byte company ID + 5 data bytes.
+ * [2] hr_bpm  [3] spo2_int  [4] spo2_frac  [5] bat_pct  [6] seq
+ * seq increments on every advertising update so macOS Core Bluetooth's
+ * duplicate-advertisement filter never suppresses the callback.
+ */
+static uint8_t sensor_mfr_data[7] = {
+	(SENSOR_COMPANY_ID & 0xFF),
+	(SENSOR_COMPANY_ID >> 8),
+	0, 0, 0, 0xFF, 0,
 };
 
-/**
- * @brief  Send a NUL-terminated ASCII string over NUS.
- *         No-op until the central has subscribed (written CCCD = 0x0001),
- *         which only happens after GATT service discovery is complete.
- *         Sending before that would compete with ATT discovery traffic.
- */
-static void nus_send_str(const char *str)
-{
-	if (!nus_conn || !nus_notify_enabled) {
-		return;
-	}
-	int ret = bt_nus_send(nus_conn, (const uint8_t *)str, strlen(str));
-
-	if (ret && ret != -ENOTCONN) {
-		LOG_WRN("NUS send failed: %d", ret);
-	}
-}
-
-static void nus_send_enabled_cb(enum bt_nus_send_status status)
-{
-	nus_notify_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
-	LOG_INF("NUS notifications %s",
-		nus_notify_enabled ? "enabled — streaming" : "disabled");
-}
-
-static const struct bt_nus_cb nus_callbacks = {
-	.send_enabled = nus_send_enabled_cb,
+static struct bt_data sensor_ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
+	BT_DATA(BT_DATA_MANUFACTURER_DATA, sensor_mfr_data, sizeof(sensor_mfr_data)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
+		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
-/* Delayed work to restart NUS advertising after disconnect.
- * A 500 ms delay lets bt_mgmt finish restarting BIS extended advertising
- * before we call bt_le_adv_start(), avoiding -EACCES (-13) collisions.
+static volatile uint8_t sens_hr;
+static volatile uint8_t sens_spo2_i;
+static volatile uint8_t sens_spo2_f;
+static volatile uint8_t sens_bat = 0xFF;
+
+static struct k_work sensor_adv_work;
+
+static void sensor_adv_work_fn(struct k_work *work)
+{
+	sensor_mfr_data[2] = sens_hr;
+	sensor_mfr_data[3] = sens_spo2_i;
+	sensor_mfr_data[4] = sens_spo2_f;
+	sensor_mfr_data[5] = sens_bat;
+	sensor_mfr_data[6]++;  /* always-changing seq → bypasses macOS dup filter */
+	int ret = bt_le_adv_update_data(sensor_ad, ARRAY_SIZE(sensor_ad), NULL, 0);
+
+	if (ret && ret != -EAGAIN) {
+		LOG_DBG("Sensor adv update: %d", ret);
+	}
+}
+
+static void sensor_notify_hr(uint8_t hr)
+{ sens_hr = hr; k_work_submit(&sensor_adv_work); }
+
+static void sensor_notify_spo2(uint8_t spo2_i, uint8_t spo2_f)
+{ sens_spo2_i = spo2_i; sens_spo2_f = spo2_f; k_work_submit(&sensor_adv_work); }
+
+static void sensor_notify_bat(uint8_t pct)
+{ sens_bat = pct; k_work_submit(&sensor_adv_work); }
+
+/* Periodic timer: force an adv update every 2 s even when sensor values are
+ * unchanged.  Without this, a stable signal produces identical packets and
+ * macOS stops delivering BleakScanner callbacks after the first one.
  */
-static struct k_work_delayable nus_adv_restart_work;
-
-static void nus_adv_restart_handler(struct k_work *work)
+static void sensor_beacon_timer_fn(struct k_timer *timer)
 {
-	/* Always stop first to tear down any stale advertising handle left
-	 * by a previous connection or a 0x28 (Instant Passed) disconnect.
-	 * Without this, bt_le_adv_start returns -EALREADY (handle appears
-	 * running) but the handle is actually invalid, and the next connection
-	 * attempt triggers "No valid adv" inside Zephyr's connection setup.
-	 */
-	(void)bt_le_adv_stop();
-
-	int ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, nus_ad, ARRAY_SIZE(nus_ad), NULL, 0);
-
-	if (ret == 0) {
-		LOG_INF("NUS advertising restarted");
-	} else {
-		LOG_WRN("NUS adv restart failed: %d", ret);
-	}
+	k_work_submit(&sensor_adv_work);
 }
 
-static void nus_start_advertising(void)
-{
-	/* 2 s delay: bt_mgmt needs ~1 s to finish attempting its own BIS adv
-	 * restart after an ACL disconnect before bt_le_adv_start is safe to call.
-	 */
-	k_work_schedule(&nus_adv_restart_work, K_MSEC(2000));
-}
-
-/* Accept all LL connection parameter update requests from the central.
- * Without this the host rejects updates that conflict with BIS ISO scheduling,
- * causing the controller to time out and disconnect with reason 0x28
- * ("Instant Passed").
- */
-static bool ble_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
-{
-	return true;
-}
-
-static void ble_connected(struct bt_conn *conn, uint8_t err)
-{
-	if (!err) {
-		nus_conn = bt_conn_ref(conn);
-		LOG_INF("BLE central connected");
-	}
-}
-
-static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
-{
-	if (nus_conn) {
-		bt_conn_unref(nus_conn);
-		nus_conn = NULL;
-	}
-	nus_notify_enabled = false;
-	LOG_INF("BLE central disconnected (reason %d)", reason);
-	nus_start_advertising();
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected    = ble_connected,
-	.disconnected = ble_disconnected,
-	.le_param_req = ble_le_param_req,
-};
+K_TIMER_DEFINE(sensor_beacon_timer, sensor_beacon_timer_fn, NULL);
 
 /**
  * @brief	Link zbus producers and observers.
@@ -743,29 +709,9 @@ static void polling_thread_imu(void)
 			continue;
 		}
 
-		int16_t gx = (int16_t)((raw[1]  << 8) | raw[0]);
-		int16_t gy = (int16_t)((raw[3]  << 8) | raw[2]);
-		int16_t gz = (int16_t)((raw[5]  << 8) | raw[4]);
-		int16_t ax = (int16_t)((raw[7]  << 8) | raw[6]);
-		int16_t ay = (int16_t)((raw[9]  << 8) | raw[8]);
-		int16_t az = (int16_t)((raw[11] << 8) | raw[10]);
-
-		/* Send every sample at 25 Hz.
-		 * Values ÷ 100 to fit in the 20-byte ATT payload:
-		 *   Accel: 1 unit = 6.1 mg    (0.061 mg/LSB × 100)
-		 *   Gyro:  1 unit = 437.5 mdps (4.375 mdps/LSB × 100)
-		 * Worst-case: "A:-327,-327,-327\n" = 17 bytes < 20 bytes.
-		 */
-		char buf[24];
-
-		snprintk(buf, sizeof(buf), "A:%d,%d,%d\n",
-			 ax / 100, ay / 100, az / 100);
-		nus_send_str(buf);
-
-		snprintk(buf, sizeof(buf), "G:%d,%d,%d\n",
-			 gx / 100, gy / 100, gz / 100);
-		nus_send_str(buf);
-
+		/* IMU data available in raw[0..11] — reserved for future
+		 * motion-artifact correction in the on-chip PPG pipeline.
+		 * Raw values no longer transmitted over NUS. */
 		k_msleep(40); /* 25 Hz */
 	}
 }
@@ -795,11 +741,9 @@ static void polling_thread_battery(void)
 			printk("Battery SOC read error: %d\n", ret);
 		} else {
 			uint16_t soc = buf[0] | ((uint16_t)buf[1] << 8); /* little-endian */
-			char nbuf[16];
 
-			snprintk(nbuf, sizeof(nbuf), "B:%d%%\n", soc);
-			printk("%s", nbuf);
-			nus_send_str(nbuf);
+			printk("Battery: %d%%\n", soc);
+			sensor_notify_bat((uint8_t)soc);
 		}
 
 		k_msleep(10000); /* every 10 s — SOC changes slowly */
@@ -809,52 +753,201 @@ static void polling_thread_battery(void)
 K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NULL, 13, 0, 0);
 
 /* -------------------------------------------------------------------------
- * SpO2 / PPG thread — MAX30101 raw FIFO at ~100 Hz
+ * On-chip HR / SpO2 computation
+ *
+ * HR:   Peak detection on DC-removed IR signal.
+ *       Rolling mean of last 8 RR intervals → BPM.
+ *       Emits  "H:nn\n"     every PPG_FS samples (≈ 1 s).
+ *
+ * SpO2: Ratio-of-ratios over a 5 s sliding window.
+ *       R = (AC_red / DC_red) / (AC_ir / DC_ir)
+ *       SpO2 ≈ 110 − 25 × R   (empirical linear fit, ±3 %)
+ *       Emits  "O:nn.n\n"   every PPG_O2_PERIOD samples (≈ 5 s).
+ *
+ * Effective sample rate: 25 Hz (one FIFO read every 40 ms sleep).
+ * All state is static (BSS), not on stack.
+ * -------------------------------------------------------------------------
+ */
+#define PPG_FS         25              /* effective Hz            */
+#define PPG_WIN       125              /* 5 s sliding window      */
+#define PPG_RR_HIST     8              /* beat intervals to keep  */
+#define PPG_HR_PERIOD  PPG_FS         /* emit H: every 1 s       */
+#define PPG_O2_PERIOD  (5 * PPG_FS)   /* emit O: every 5 s       */
+
+static int32_t  ppg_ir_win[PPG_WIN];
+static int32_t  ppg_red_win[PPG_WIN];
+static uint16_t ppg_win_head;
+static uint16_t ppg_win_n;
+
+static int32_t  ppg_dc_ir;
+static int32_t  ppg_ac_prev;
+static int32_t  ppg_ac_pprev;
+static uint32_t ppg_tick;
+static uint32_t ppg_beat_tick;
+static uint32_t ppg_rr[PPG_RR_HIST];
+static uint8_t  ppg_rr_wr;
+static uint8_t  ppg_rr_n;
+
+static int ppg_hr_bpm(void)
+{
+	if (ppg_rr_n < 2) {
+		return 0;
+	}
+	uint32_t sum = 0;
+
+	for (int i = 0; i < ppg_rr_n; i++) {
+		sum += ppg_rr[i];
+	}
+	uint32_t avg = sum / ppg_rr_n;
+
+	return avg ? (int)((60u * PPG_FS + avg / 2u) / avg) : 0;
+}
+
+/* Returns SpO2 × 10 (e.g. 985 → 98.5 %), or 0 if no valid signal. */
+static int ppg_spo2_x10(void)
+{
+	if (ppg_win_n < PPG_WIN) {
+		return 0;
+	}
+
+	int64_t sum_ir  = ppg_ir_win[0];
+	int64_t sum_red = ppg_red_win[0];
+	int32_t mn_ir   = ppg_ir_win[0],  mx_ir  = ppg_ir_win[0];
+	int32_t mn_red  = ppg_red_win[0], mx_red = ppg_red_win[0];
+
+	for (int i = 1; i < PPG_WIN; i++) {
+		sum_ir  += ppg_ir_win[i];
+		sum_red += ppg_red_win[i];
+		if (ppg_ir_win[i]  < mn_ir)  mn_ir  = ppg_ir_win[i];
+		if (ppg_ir_win[i]  > mx_ir)  mx_ir  = ppg_ir_win[i];
+		if (ppg_red_win[i] < mn_red) mn_red = ppg_red_win[i];
+		if (ppg_red_win[i] > mx_red) mx_red = ppg_red_win[i];
+	}
+
+	int32_t dc_ir  = (int32_t)(sum_ir  / PPG_WIN);
+	int32_t dc_red = (int32_t)(sum_red / PPG_WIN);
+	int32_t ac_ir  = mx_ir  - mn_ir;
+	int32_t ac_red = mx_red - mn_red;
+
+	/* Require ≥ 0.5% AC swing as proxy for finger contact */
+	if (dc_ir == 0 || dc_red == 0 || ac_ir < dc_ir / 200) {
+		return 0;
+	}
+
+	/* R = (AC_red / DC_red) / (AC_ir / DC_ir) — integer × 1000 */
+	int32_t R = (int32_t)(((int64_t)ac_red * dc_ir * 1000) /
+			       ((int64_t)dc_red * ac_ir));
+
+	/* SpO2% × 10:  SpO2 ≈ 110 − 25 × R */
+	int32_t sp10 = 1100 - (25 * R) / 100;
+
+	return (sp10 >= 700 && sp10 <= 1000) ? sp10 : 0;
+}
+
+static void ppg_add(uint32_t ir_raw, uint32_t red_raw)
+{
+	int32_t ir  = (int32_t)ir_raw;
+	int32_t red = (int32_t)red_raw;
+
+	ppg_ir_win[ppg_win_head]  = ir;
+	ppg_red_win[ppg_win_head] = red;
+	ppg_win_head = (ppg_win_head + 1) % PPG_WIN;
+	if (ppg_win_n < PPG_WIN) {
+		ppg_win_n++;
+	}
+
+	ppg_tick++;
+
+	/* DC removal: EMA alpha ≈ 1/64; seed from first sample */
+	if (ppg_tick == 1) {
+		ppg_dc_ir = ir;
+	} else {
+		ppg_dc_ir += (ir - ppg_dc_ir) >> 6;
+	}
+	int32_t ac = ir - ppg_dc_ir;
+
+	/* Peak: local maximum above ~0.8% of DC, after 3 s warm-up.
+	 * Detects when ac[t-2] < ac[t-1] > ac[t] and ac[t-1] > threshold.
+	 */
+	if (ppg_ac_pprev < ppg_ac_prev &&
+	    ppg_ac_prev  >  ac         &&
+	    ppg_ac_prev  > (ppg_dc_ir >> 7) &&
+	    ppg_tick     > (3u * PPG_FS)) {
+
+		if (ppg_beat_tick > 0) {
+			uint32_t rr = (ppg_tick - 1u) - ppg_beat_tick;
+			/* Accept 18–180 BPM at 25 Hz: 8–83 ticks */
+			if (rr >= 8 && rr <= 83) {
+				ppg_rr[ppg_rr_wr % PPG_RR_HIST] = rr;
+				ppg_rr_wr++;
+				if (ppg_rr_n < PPG_RR_HIST) {
+					ppg_rr_n++;
+				}
+			}
+		}
+		ppg_beat_tick = ppg_tick - 1u;
+	}
+
+	ppg_ac_pprev = ppg_ac_prev;
+	ppg_ac_prev  = ac;
+}
+
+/* -------------------------------------------------------------------------
+ * SpO2 / PPG thread — MAX30101 FIFO at 25 Hz effective rate
  * -------------------------------------------------------------------------
  */
 void polling_thread_spo2(void)
 {
-    /* Wait for main() to configure the MAX30101 before reading */
-    k_msleep(2000);
+	k_msleep(2000);
 
-    const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
-    if (!device_is_ready(pulse_dev)) {
-        printk("SpO2 device not ready!\n");
-        return;
-    }
+	const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
 
-    uint8_t fifo[9]; /* 3 bytes each: red, ir, green */
+	if (!device_is_ready(pulse_dev)) {
+		printk("SpO2 device not ready!\n");
+		return;
+	}
 
-    while (1) {
-        /* Read one FIFO entry (rollover keeps it fresh) */
-        int ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x07, fifo, 9);
-        if (ret) {
-            printk("FIFO read error %d\n", ret);
-            k_msleep(40);
-            continue;
-        }
+	uint8_t  fifo[9]; /* 3 bytes each: red, ir, green */
+	uint32_t sample_n = 0;
 
-        uint32_t red   = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
-        uint32_t ir    = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
-        uint32_t green = ((fifo[6] << 16) | (fifo[7] << 8) | fifo[8]) & 0x3FFFF;
+	while (1) {
+		int ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x07, fifo, 9);
 
-        /* Send every sample at 25 Hz.
-         * Right-shift 2 bits (÷4) so worst-case 18-bit values fit in 20-byte
-         * ATT payload: "P:65535,65535,65535\n" = 20 bytes exactly.
-         * Receiver multiplies by 4 to recover approximate ADC counts.
-         */
-        char pbuf[24];
+		if (ret) {
+			printk("FIFO read error %d\n", ret);
+			k_msleep(40);
+			continue;
+		}
 
-        snprintk(pbuf, sizeof(pbuf), "P:%u,%u,%u\n",
-                 red >> 2, ir >> 2, green >> 2);
-        nus_send_str(pbuf);
+		uint32_t red = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
+		uint32_t ir  = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
 
-        k_msleep(40); /* 25 Hz */
-    }
+		ppg_add(ir, red);
+		sample_n++;
+
+		if (sample_n % PPG_HR_PERIOD == 0) {
+			int hr = ppg_hr_bpm();
+
+			if (hr > 0) {
+				sensor_notify_hr((uint8_t)hr);
+			}
+		}
+
+		if (sample_n % PPG_O2_PERIOD == 0) {
+			int sp10 = ppg_spo2_x10();
+
+			if (sp10 > 0) {
+				sensor_notify_spo2((uint8_t)(sp10 / 10),
+						   (uint8_t)(sp10 % 10));
+			}
+		}
+
+		k_msleep(40);
+	}
 }
 
 K_THREAD_DEFINE(spo2_thread_id, 2048, polling_thread_spo2,
-                NULL, NULL, NULL, 12, 0, 0);
+		NULL, NULL, NULL, 12, 0, 0);
 
 
 int main(void)
@@ -954,21 +1047,27 @@ int main(void)
 
 	LOG_INF("Broadcast source: %s started", CONFIG_BT_AUDIO_BROADCAST_NAME);
 
-	ret = bt_nus_init(&nus_callbacks);
-	if (ret) {
-		LOG_ERR("Failed to init NUS: %d", ret);
-		return ret;
-	}
+	k_work_init(&sensor_adv_work, sensor_adv_work_fn);
+	k_timer_start(&sensor_beacon_timer, K_MSEC(2000), K_MSEC(2000));
 
-	k_work_init_delayable(&nus_adv_restart_work, nus_adv_restart_handler);
-
-	/* Start NUS advertising immediately at boot (no BIS restart conflict yet) */
-	int adv_ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, nus_ad, ARRAY_SIZE(nus_ad), NULL, 0);
+	static const struct bt_le_adv_param sensor_adv_param = {
+		.id                 = BT_ID_DEFAULT,
+		.sid                = 0U,
+		.secondary_max_skip = 0U,
+		.options            = BT_LE_ADV_OPT_NONE,
+		.interval_min       = 0x0640U, /* 1000 ms */
+		.interval_max       = 0x0800U, /* 1280 ms */
+		.peer               = NULL,
+	};
+	int adv_ret = bt_le_adv_start(&sensor_adv_param,
+				       sensor_ad, ARRAY_SIZE(sensor_ad), NULL, 0);
 
 	if (adv_ret && adv_ret != -EALREADY) {
-		LOG_WRN("NUS adv start failed: %d", adv_ret);
+		LOG_WRN("Sensor adv start failed: %d", adv_ret);
+	} else {
+		LOG_INF("Sensor beacon started (ADV_NONCONN_IND, 1 s) as %s",
+			CONFIG_BT_DEVICE_NAME);
 	}
-	LOG_INF("NUS advertising started — connect as %s", CONFIG_BT_DEVICE_NAME);
 
 	return 0;
 }

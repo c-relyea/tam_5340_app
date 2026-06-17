@@ -179,18 +179,22 @@ static void button_msg_sub_thread(void)
 				static bool test_tone_active;
 
 				if (strm_state != STATE_STREAMING) {
-					LOG_WRN("Not in streaming state");
+					LOG_INF("BUTTON_4: not streaming (state=%d)", strm_state);
 					break;
 				}
 
 				test_tone_active = !test_tone_active;
-				ret = audio_system_encode_test_tone_set(
-					test_tone_active ? 1000 : 0);
+
+				if (test_tone_active) {
+					ret = audio_system_encode_test_tone_step();
+				} else {
+					ret = audio_system_encode_test_tone_set(0);
+					LOG_INF("Test tone OFF");
+				}
+
 				if (ret) {
 					LOG_WRN("Failed to set test tone: %d", ret);
-				} else {
-					LOG_INF("Test tone %s",
-						test_tone_active ? "ON (1 kHz)" : "OFF");
+					test_tone_active = false;
 				}
 
 				break;

@@ -384,7 +384,8 @@ static volatile uint8_t sens_spo2_i;
 static volatile uint8_t sens_spo2_f;
 static volatile uint8_t sens_bat = 0xFF;
 
-static struct k_work sensor_adv_work;
+static void sensor_adv_work_fn(struct k_work *work);
+K_WORK_DEFINE(sensor_adv_work, sensor_adv_work_fn);
 
 static void sensor_adv_work_fn(struct k_work *work)
 {
@@ -1047,7 +1048,6 @@ int main(void)
 
 	LOG_INF("Broadcast source: %s started", CONFIG_BT_AUDIO_BROADCAST_NAME);
 
-	k_work_init(&sensor_adv_work, sensor_adv_work_fn);
 	k_timer_start(&sensor_beacon_timer, K_MSEC(2000), K_MSEC(2000));
 
 	static const struct bt_le_adv_param sensor_adv_param = {

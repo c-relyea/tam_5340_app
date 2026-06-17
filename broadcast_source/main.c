@@ -148,7 +148,7 @@ static void button_msg_sub_thread(void)
 		ret = zbus_chan_read(chan, &msg, ZBUS_READ_TIMEOUT_MS);
 		ERR_CHK(ret);
 
-		LOG_DBG("Got btn evt from queue - id = %d, action = %d", msg.button_pin,
+		LOG_INF("Got btn evt from queue - id = %d, action = %d", msg.button_pin,
 			msg.button_action);
 
 		if (msg.button_action != BUTTON_PRESS) {

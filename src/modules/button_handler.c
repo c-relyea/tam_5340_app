@@ -161,7 +161,7 @@ static void button_isr(const struct device *port, struct gpio_callback *cb, uint
 	ret = pin_to_btn_idx(btn_pin, &btn_idx);
 	ERR_CHK(ret);
 
-	LOG_DBG("Pushed button idx: %d pin: %d name: %s", btn_idx, btn_pin,
+	LOG_INF("Pushed button idx: %d pin: %d name: %s", btn_idx, btn_pin,
 		btn_cfg[btn_idx].btn_name);
 
 	msg.button_pin = btn_pin;

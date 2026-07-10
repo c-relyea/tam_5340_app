@@ -148,7 +148,7 @@ static void button_msg_sub_thread(void)
 		ret = zbus_chan_read(chan, &msg, ZBUS_READ_TIMEOUT_MS);
 		ERR_CHK(ret);
 
-		LOG_INF("Got btn evt from queue - id = %d, action = %d", msg.button_pin,
+		LOG_DBG("Got btn evt from queue - id = %d, action = %d", msg.button_pin,
 			msg.button_action);
 
 		if (msg.button_action != BUTTON_PRESS) {
@@ -774,133 +774,224 @@ K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NUL
  * -------------------------------------------------------------------------
  */
 #define PPG_FS         25              /* effective Hz            */
-#define PPG_WIN       125              /* 5 s sliding window      */
-#define PPG_RR_HIST     8              /* beat intervals to keep  */
-#define PPG_HR_PERIOD  PPG_FS         /* emit H: every 1 s       */
-#define PPG_O2_PERIOD  (5 * PPG_FS)   /* emit O: every 5 s       */
+#define PPG_WIN       200              /* 8 s sliding window      */
+#define PPG_HR_PERIOD  PPG_FS          /* emit H: every 1 s       */
+#define PPG_O2_PERIOD  PPG_FS          /* emit O: every 1 s       */
+
+/* Autocorrelation lag range: 8..38 ticks @ 25 Hz = 187..39 bpm */
+#define PPG_LAG_MIN     8
+#define PPG_LAG_MAX    38
+/* Minimum normalized autocorrelation (×1024) to accept an HR lock.
+ * Neck recordings with good contact score 700-900; noise scores < 200.
+ */
+#define PPG_MIN_QUAL  300
+/* Minimum DC level (counts) on IR and red to consider skin contact.
+ * Air reads < 1500; skin contact reads > 50000.
+ */
+#define PPG_MIN_DC  20000
 
 static int32_t  ppg_ir_win[PPG_WIN];
 static int32_t  ppg_red_win[PPG_WIN];
+static int32_t  ppg_grn_win[PPG_WIN];
 static uint16_t ppg_win_head;
 static uint16_t ppg_win_n;
 
-static int32_t  ppg_dc_ir;
-static int32_t  ppg_ac_prev;
-static int32_t  ppg_ac_pprev;
-static uint32_t ppg_tick;
-static uint32_t ppg_beat_tick;
-static uint32_t ppg_rr[PPG_RR_HIST];
-static uint8_t  ppg_rr_wr;
-static uint8_t  ppg_rr_n;
+/* Scratch (static: keep off the 2 KB thread stack) */
+static int32_t ppg_lin[PPG_WIN];
+static int32_t ppg_det[PPG_WIN];
+static int64_t ppg_ps[PPG_WIN + 1];
 
-static int ppg_hr_bpm(void)
+/* Quality (×1024) of the most recent HR lock; SpO2 requires a locked HR */
+static int32_t ppg_last_qual;
+
+static void ppg_add(uint32_t ir_raw, uint32_t red_raw, uint32_t grn_raw)
 {
-	if (ppg_rr_n < 2) {
-		return 0;
-	}
-	uint32_t sum = 0;
-
-	for (int i = 0; i < ppg_rr_n; i++) {
-		sum += ppg_rr[i];
-	}
-	uint32_t avg = sum / ppg_rr_n;
-
-	return avg ? (int)((60u * PPG_FS + avg / 2u) / avg) : 0;
-}
-
-/* Returns SpO2 × 10 (e.g. 985 → 98.5 %), or 0 if no valid signal. */
-static int ppg_spo2_x10(void)
-{
-	if (ppg_win_n < PPG_WIN) {
-		return 0;
-	}
-
-	int64_t sum_ir  = ppg_ir_win[0];
-	int64_t sum_red = ppg_red_win[0];
-	int32_t mn_ir   = ppg_ir_win[0],  mx_ir  = ppg_ir_win[0];
-	int32_t mn_red  = ppg_red_win[0], mx_red = ppg_red_win[0];
-
-	for (int i = 1; i < PPG_WIN; i++) {
-		sum_ir  += ppg_ir_win[i];
-		sum_red += ppg_red_win[i];
-		if (ppg_ir_win[i]  < mn_ir)  mn_ir  = ppg_ir_win[i];
-		if (ppg_ir_win[i]  > mx_ir)  mx_ir  = ppg_ir_win[i];
-		if (ppg_red_win[i] < mn_red) mn_red = ppg_red_win[i];
-		if (ppg_red_win[i] > mx_red) mx_red = ppg_red_win[i];
-	}
-
-	int32_t dc_ir  = (int32_t)(sum_ir  / PPG_WIN);
-	int32_t dc_red = (int32_t)(sum_red / PPG_WIN);
-	int32_t ac_ir  = mx_ir  - mn_ir;
-	int32_t ac_red = mx_red - mn_red;
-
-	/* Require ≥ 0.5% AC swing as proxy for finger contact */
-	if (dc_ir == 0 || dc_red == 0 || ac_ir < dc_ir / 200) {
-		return 0;
-	}
-
-	/* R = (AC_red / DC_red) / (AC_ir / DC_ir) — integer × 1000 */
-	int32_t R = (int32_t)(((int64_t)ac_red * dc_ir * 1000) /
-			       ((int64_t)dc_red * ac_ir));
-
-	/* SpO2% × 10:  SpO2 ≈ 110 − 25 × R */
-	int32_t sp10 = 1100 - (25 * R) / 100;
-
-	return (sp10 >= 700 && sp10 <= 1000) ? sp10 : 0;
-}
-
-static void ppg_add(uint32_t ir_raw, uint32_t red_raw)
-{
-	int32_t ir  = (int32_t)ir_raw;
-	int32_t red = (int32_t)red_raw;
-
-	ppg_ir_win[ppg_win_head]  = ir;
-	ppg_red_win[ppg_win_head] = red;
+	ppg_ir_win[ppg_win_head]  = (int32_t)ir_raw;
+	ppg_red_win[ppg_win_head] = (int32_t)red_raw;
+	ppg_grn_win[ppg_win_head] = (int32_t)grn_raw;
 	ppg_win_head = (ppg_win_head + 1) % PPG_WIN;
 	if (ppg_win_n < PPG_WIN) {
 		ppg_win_n++;
 	}
+}
 
-	ppg_tick++;
+/* Copy a circular window into ppg_lin[] in time order, then remove the
+ * baseline with a centered 1 s moving average: ppg_det[] = signal - trend.
+ * Also returns the window mean (DC level).
+ */
+static int32_t ppg_detrend(const int32_t *win)
+{
+	const int half = PPG_FS / 2;
 
-	/* DC removal: EMA alpha ≈ 1/64; seed from first sample */
-	if (ppg_tick == 1) {
-		ppg_dc_ir = ir;
-	} else {
-		ppg_dc_ir += (ir - ppg_dc_ir) >> 6;
+	for (int i = 0; i < PPG_WIN; i++) {
+		ppg_lin[i] = win[(ppg_win_head + i) % PPG_WIN];
 	}
-	int32_t ac = ir - ppg_dc_ir;
 
-	/* Peak: local maximum above ~0.8% of DC, after 3 s warm-up.
-	 * Detects when ac[t-2] < ac[t-1] > ac[t] and ac[t-1] > threshold.
-	 */
-	if (ppg_ac_pprev < ppg_ac_prev &&
-	    ppg_ac_prev  >  ac         &&
-	    ppg_ac_prev  > (ppg_dc_ir >> 7) &&
-	    ppg_tick     > (3u * PPG_FS)) {
+	ppg_ps[0] = 0;
+	for (int i = 0; i < PPG_WIN; i++) {
+		ppg_ps[i + 1] = ppg_ps[i] + ppg_lin[i];
+	}
 
-		if (ppg_beat_tick > 0) {
-			uint32_t rr = (ppg_tick - 1u) - ppg_beat_tick;
-			/* Accept 18–180 BPM at 25 Hz: 8–83 ticks */
-			if (rr >= 8 && rr <= 83) {
-				ppg_rr[ppg_rr_wr % PPG_RR_HIST] = rr;
-				ppg_rr_wr++;
-				if (ppg_rr_n < PPG_RR_HIST) {
-					ppg_rr_n++;
-				}
-			}
+	for (int i = 0; i < PPG_WIN; i++) {
+		int lo = MAX(0, i - half);
+		int hi = MIN(PPG_WIN - 1, i + half);
+		int32_t ma = (int32_t)((ppg_ps[hi + 1] - ppg_ps[lo]) / (hi - lo + 1));
+
+		ppg_det[i] = ppg_lin[i] - ma;
+	}
+
+	return (int32_t)(ppg_ps[PPG_WIN] / PPG_WIN);
+}
+
+static uint32_t ppg_isqrt64(uint64_t v)
+{
+	uint64_t r = 0;
+	uint64_t bit = 1ULL << 62;
+
+	while (bit > v) {
+		bit >>= 2;
+	}
+	while (bit) {
+		if (v >= r + bit) {
+			v -= r + bit;
+			r = (r >> 1) + bit;
+		} else {
+			r >>= 1;
 		}
-		ppg_beat_tick = ppg_tick - 1u;
+		bit >>= 2;
+	}
+	return (uint32_t)r;
+}
+
+/* Heart rate from autocorrelation of the detrended GREEN channel.
+ * Green has 5-10x the relative pulsation of IR/red in reflective
+ * (neck/wrist) placement, so it is the HR channel of choice.
+ * Returns bpm ×10, or 0 if no confident lock.  Updates ppg_last_qual.
+ */
+static int ppg_hr_bpm_x10(void)
+{
+	ppg_last_qual = 0;
+
+	if (ppg_win_n < PPG_WIN) {
+		return 0;
 	}
 
-	ppg_ac_pprev = ppg_ac_prev;
-	ppg_ac_prev  = ac;
+	(void)ppg_detrend(ppg_grn_win);
+
+	int64_t energy = 0;
+
+	for (int i = 0; i < PPG_WIN; i++) {
+		energy += (int64_t)ppg_det[i] * ppg_det[i];
+	}
+	if (energy == 0) {
+		return 0;
+	}
+
+	int32_t r_at[PPG_LAG_MAX + 2] = { 0 };
+	int best_lag = 0;
+	int32_t best_r = 0;
+
+	for (int lag = PPG_LAG_MIN; lag <= PPG_LAG_MAX; lag++) {
+		int64_t s = 0;
+
+		for (int i = 0; i < PPG_WIN - lag; i++) {
+			s += (int64_t)ppg_det[i] * ppg_det[i + lag];
+		}
+		r_at[lag] = (int32_t)((1024 * s) / energy);
+		if (r_at[lag] > best_r) {
+			best_r = r_at[lag];
+			best_lag = lag;
+		}
+	}
+
+	if (best_r < PPG_MIN_QUAL) {
+		return 0;
+	}
+
+	/* Harmonic guard: if the half-lag (double rate) correlates almost as
+	 * well, the true beat is the faster one.
+	 */
+	int L = best_lag;
+
+	if (L / 2 >= PPG_LAG_MIN && 10 * r_at[L / 2] >= 7 * best_r) {
+		L = L / 2;
+		best_r = r_at[L];
+	}
+
+	/* Parabolic interpolation around the peak, Q8 sub-lag resolution */
+	int32_t r1 = (L - 1 >= PPG_LAG_MIN) ? r_at[L - 1] : 0;
+	int32_t r2 = r_at[L];
+	int32_t r3 = (L + 1 <= PPG_LAG_MAX) ? r_at[L + 1] : 0;
+	int32_t den = r1 - 2 * r2 + r3;
+	int32_t delta_q8 = den ? (128 * (r1 - r3)) / (2 * den) : 0;
+
+	delta_q8 = CLAMP(delta_q8, -128, 128);
+
+	ppg_last_qual = best_r;
+
+	/* bpm ×10 = 60*FS*10 / (L + delta/256) */
+	return (int)((15000 * 2560) / (L * 256 + delta_q8) / 10);
+}
+
+/* SpO2 from RMS ratio-of-ratios over the same 8 s window.
+ * R = (ACrms_red/DC_red) / (ACrms_ir/DC_ir);  SpO2 = 110 - 25R.
+ * Only emitted with skin contact (DC floor), measurable IR perfusion,
+ * and a currently locked HR (cardiac signal present).
+ * Returns SpO2 ×10 (700..1000) or 0.
+ */
+static int ppg_spo2_x10(void)
+{
+	if (ppg_win_n < PPG_WIN || ppg_last_qual < PPG_MIN_QUAL) {
+		return 0;
+	}
+
+	int32_t dc_ir = ppg_detrend(ppg_ir_win);
+	int64_t e_ir = 0;
+
+	for (int i = 0; i < PPG_WIN; i++) {
+		e_ir += (int64_t)ppg_det[i] * ppg_det[i];
+	}
+
+	int32_t dc_red = ppg_detrend(ppg_red_win);
+	int64_t e_red = 0;
+
+	for (int i = 0; i < PPG_WIN; i++) {
+		e_red += (int64_t)ppg_det[i] * ppg_det[i];
+	}
+
+	int32_t ac_ir  = (int32_t)ppg_isqrt64((uint64_t)(e_ir / PPG_WIN));
+	int32_t ac_red = (int32_t)ppg_isqrt64((uint64_t)(e_red / PPG_WIN));
+
+	if (dc_ir < PPG_MIN_DC || dc_red < PPG_MIN_DC || ac_ir == 0) {
+		return 0;
+	}
+
+	/* IR perfusion index ×10000; require >= 0.03% */
+	int32_t pi_ir = (int32_t)((10000LL * ac_ir) / dc_ir);
+
+	if (pi_ir < 3) {
+		return 0;
+	}
+
+	int32_t R1000 = (int32_t)(((int64_t)ac_red * dc_ir * 1000) /
+				  ((int64_t)dc_red * ac_ir));
+	int32_t sp10 = 1100 - (25 * R1000) / 100;
+
+	return (sp10 >= 700 && sp10 <= 1000) ? sp10 : 0;
 }
 
 /* -------------------------------------------------------------------------
  * SpO2 / PPG thread — MAX30101 FIFO at 25 Hz effective rate
  * -------------------------------------------------------------------------
  */
+
+/* Set to 1 to stream raw PPG samples over RTT as CSV lines:
+ *   P,<uptime_ms>,<ir>,<red>,<green>
+ * Capture with log_ppg.sh (or any RTT logger) and filter lines starting
+ * with "P," into a .csv.  ~25 lines/s, negligible RTT bandwidth.
+ */
+#define PPG_RAW_LOG 1
+
 void polling_thread_spo2(void)
 {
 	k_msleep(2000);
@@ -924,26 +1015,52 @@ void polling_thread_spo2(void)
 			continue;
 		}
 
-		uint32_t red = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
-		uint32_t ir  = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
+		uint32_t red   = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
+		uint32_t ir    = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
+		uint32_t green = ((fifo[6] << 16) | (fifo[7] << 8) | fifo[8]) & 0x3FFFF;
 
-		ppg_add(ir, red);
+#if PPG_RAW_LOG
+		printk("P,%u,%u,%u,%u\n", k_uptime_get_32(), ir, red, green);
+#endif
+
+		ppg_add(ir, red, green);
 		sample_n++;
 
-		if (sample_n % PPG_HR_PERIOD == 0) {
-			int hr = ppg_hr_bpm();
+		/* After this many seconds without a valid reading, zero the
+		 * beacon fields (0 = "no data") so receivers can't mistake a
+		 * stale last value for a live one.
+		 */
+		#define PPG_STALE_SEC 10
+		static uint16_t hr_stale_s;
+		static uint16_t sp_stale_s;
 
-			if (hr > 0) {
-				sensor_notify_hr((uint8_t)hr);
+		if (sample_n % PPG_HR_PERIOD == 0) {
+			int hr10 = ppg_hr_bpm_x10();
+
+#if PPG_RAW_LOG
+			printk("H,%u,%d,%d\n", k_uptime_get_32(), hr10,
+			       ppg_last_qual);
+#endif
+			if (hr10 > 0) {
+				sensor_notify_hr((uint8_t)((hr10 + 5) / 10));
+				hr_stale_s = 0;
+			} else if (++hr_stale_s == PPG_STALE_SEC) {
+				sensor_notify_hr(0);
 			}
 		}
 
 		if (sample_n % PPG_O2_PERIOD == 0) {
 			int sp10 = ppg_spo2_x10();
 
+#if PPG_RAW_LOG
+			printk("O,%u,%d\n", k_uptime_get_32(), sp10);
+#endif
 			if (sp10 > 0) {
 				sensor_notify_spo2((uint8_t)(sp10 / 10),
 						   (uint8_t)(sp10 % 10));
+				sp_stale_s = 0;
+			} else if (++sp_stale_s == PPG_STALE_SEC) {
+				sensor_notify_spo2(0, 0);
 			}
 		}
 
@@ -975,15 +1092,21 @@ int main(void)
         // SpO2 config: gain, sample rate 100Hz, pulse width 411 µs
         i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0A, 0x4F);
 
-        /* LED currents: each LSB = 0.2 mA.
-         * RED   0x50 = 80  × 0.2 mA = 16.0 mA  (unchanged — good mid-range level)
-         * IR    0x30 = 48  × 0.2 mA =  9.6 mA  (was 0x80 = 25.6 mA — was saturating ADC)
-         * GREEN 0x30 = 48  × 0.2 mA =  9.6 mA  (was 0x80 = 25.6 mA)
-         * Target: all channels at 40–70 % of 18-bit ADC full scale with finger contact.
-         * Tune 0x0C/0x0D/0x0E up or down if any channel still clips or is too dim. */
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0C, 0x50); // RED   16.0 mA
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0D, 0x30); // IR     9.6 mA
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0E, 0x30); // GREEN  9.6 mA
+        /* LED currents: each LSB = 0.2 mA.  Tuned for NECK (reflective)
+         * placement from recorded data:
+         * RED   0x60 = 19.2 mA  (neck DC was ~101k/262k at 16 mA — headroom)
+         * IR    0x60 = 19.2 mA  (neck DC was ~81k/262k at 9.6 mA; SpO2 needs
+         *                        every bit of IR/red AC SNR at 0.1-0.2 % PI)
+         * GREEN 0x50+0x50 = 32 mA total: green is the HR channel on the neck
+         *   (5-10x the relative pulsation of IR/red) but its DC was only
+         *   ~4.7k/262k at 9.6 mA.  In multi-LED mode with SLOTx=011 the green
+         *   LED sinks current from BOTH LED3_PA and LED4_PA (datasheet
+         *   Table 9 note), so both are set.
+         * Watch for clipping near 262143 counts if contact/coupling improves. */
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0C, 0x60); // RED   19.2 mA
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0D, 0x60); // IR    19.2 mA
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0E, 0x50); // GREEN 16.0 mA (DAC 1)
+        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0F, 0x50); // GREEN 16.0 mA (DAC 2)
 
         // *** MULTI-LED SLOTS (THIS WAS MISSING!) ***
         i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x11, 0x21); // slot1=RED, slot2=IR
@@ -1052,15 +1175,15 @@ int main(void)
 
 	LOG_INF("Broadcast source: %s started", CONFIG_BT_AUDIO_BROADCAST_NAME);
 
-	k_timer_start(&sensor_beacon_timer, K_MSEC(2000), K_MSEC(2000));
+	k_timer_start(&sensor_beacon_timer, K_MSEC(4000), K_MSEC(4000));
 
 	static const struct bt_le_adv_param sensor_adv_param = {
 		.id                 = BT_ID_DEFAULT,
 		.sid                = 0U,
 		.secondary_max_skip = 0U,
 		.options            = BT_LE_ADV_OPT_NONE,
-		.interval_min       = 0x0640U, /* 1000 ms */
-		.interval_max       = 0x0800U, /* 1280 ms */
+		.interval_min       = 0x0C80U, /* 2000 ms — wider gap reduces BIS ISO conflicts */
+		.interval_max       = 0x1000U, /* 2560 ms */
 		.peer               = NULL,
 	};
 	int adv_ret = bt_le_adv_start(&sensor_adv_param,

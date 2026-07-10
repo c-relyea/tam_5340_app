@@ -67,7 +67,7 @@ int nrf5340_audio_dk_init(void)
 		return ret;
 	}
 	LOG_INF("PWR_EN asserted - waiting for power rails");
-	k_sleep(K_MSEC(50));
+	k_sleep(K_MSEC(150));
 
 	ret = led_init();
 	if (ret) {

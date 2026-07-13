@@ -11,6 +11,7 @@
 #include <zephyr/zbus/zbus.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/drivers/i2c.h>
+#include <bluetooth/services/nus.h>
 
 
 #include "broadcast_source.h"
@@ -351,79 +352,116 @@ static void bt_mgmt_evt_handler(const struct zbus_channel *chan)
 ZBUS_LISTENER_DEFINE(bt_mgmt_evt_listen, bt_mgmt_evt_handler);
 
 /* -------------------------------------------------------------------------
- * Non-connectable sensor beacon — HR / SpO2 / battery in manufacturer data
+ * NUS (Nordic UART Service) — 100 Hz raw PPG streaming to a BLE central
  *
- * ADV_NONCONN_IND at ~1 s interval.  No ACL connection = zero scheduling
- * conflict with BIS ISO events on the shared nRF5340 radio.
+ * The central (dataReceive.py) connects, subscribes to the NUS TX
+ * characteristic, and receives binary packets of PPG_PKT_SAMPLES raw
+ * samples each (10 packets/s at 100 Hz).
  *
- * Payload (company ID 0xFFFF, 4 data bytes):
- *   [0]  hr_bpm    (0 = not yet computed)
- *   [1]  spo2_int  integer part of SpO2 %  (0 = not yet computed)
- *   [2]  spo2_frac fractional part × 10    (e.g. 5 → .5 %)
- *   [3]  bat_pct   battery %               (0xFF = not yet read)
+ * Packet layout (little-endian):
+ *   [0]     'P'      packet type/magic
+ *   [1]     seq      increments per packet — lets the receiver detect drops
+ *   [2]     bat_pct  battery %  (0xFF = not yet read)
+ *   [3]     count    number of samples in this packet
+ *   [4..7]  uptime_ms of the first sample
+ *   then count × { ir u24, red u24, green u24 }  (raw 18-bit ADC counts)
+ *
+ * Needs ATT MTU ≥ 101 for a full 10-sample packet; macOS negotiates 247.
+ *
+ * Coexistence with the BIS broadcast on the shared radio (see git history
+ * of the earlier NUS implementation):
+ *  - PPCP steers macOS to a 30-50 ms connection interval, a multiple of
+ *    the 10 ms BIS SDU interval
+ *  - le_param_req accepts all LL parameter updates, avoiding 0x28
+ *    "Instant Passed" disconnects
  * -------------------------------------------------------------------------
  */
-#define SENSOR_COMPANY_ID  0xFFFF
+static struct bt_conn *nus_conn;
+static bool nus_notify_enabled; /* set when central writes CCCD = 0x0001 */
+static volatile uint8_t sens_bat = 0xFF;
 
-/* Payload: 2-byte company ID + 5 data bytes.
- * [2] hr_bpm  [3] spo2_int  [4] spo2_frac  [5] bat_pct  [6] seq
- * seq increments on every advertising update so macOS Core Bluetooth's
- * duplicate-advertisement filter never suppresses the callback.
- */
-static uint8_t sensor_mfr_data[7] = {
-	(SENSOR_COMPANY_ID & 0xFF),
-	(SENSOR_COMPANY_ID >> 8),
-	0, 0, 0, 0xFF, 0,
-};
-
-static struct bt_data sensor_ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA(BT_DATA_MANUFACTURER_DATA, sensor_mfr_data, sizeof(sensor_mfr_data)),
+static const struct bt_data nus_ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
-static volatile uint8_t sens_hr;
-static volatile uint8_t sens_spo2_i;
-static volatile uint8_t sens_spo2_f;
-static volatile uint8_t sens_bat = 0xFF;
-
-static void sensor_adv_work_fn(struct k_work *work);
-K_WORK_DEFINE(sensor_adv_work, sensor_adv_work_fn);
-
-static void sensor_adv_work_fn(struct k_work *work)
+static void nus_send_enabled_cb(enum bt_nus_send_status status)
 {
-	sensor_mfr_data[2] = sens_hr;
-	sensor_mfr_data[3] = sens_spo2_i;
-	sensor_mfr_data[4] = sens_spo2_f;
-	sensor_mfr_data[5] = sens_bat;
-	sensor_mfr_data[6]++;  /* always-changing seq → bypasses macOS dup filter */
-	int ret = bt_le_adv_update_data(sensor_ad, ARRAY_SIZE(sensor_ad), NULL, 0);
+	nus_notify_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
+	LOG_INF("NUS notifications %s",
+		nus_notify_enabled ? "enabled — streaming" : "disabled");
+}
 
-	if (ret && ret != -EAGAIN) {
-		LOG_DBG("Sensor adv update: %d", ret);
+static struct bt_nus_cb nus_callbacks = {
+	.send_enabled = nus_send_enabled_cb,
+};
+
+/* Delayed work to restart NUS advertising after disconnect.
+ * Stop-before-start clears stale advertising state left by a 0x28
+ * (Instant Passed) disconnect; without it bt_le_adv_start returns
+ * -EALREADY on a dead handle and the next connection gets "No valid adv".
+ * The 2 s delay lets bt_mgmt finish its own BIS adv handling first.
+ */
+static struct k_work_delayable nus_adv_restart_work;
+
+static void nus_adv_restart_handler(struct k_work *work)
+{
+	(void)bt_le_adv_stop();
+
+	int ret = bt_le_adv_start(BT_LE_ADV_CONN, nus_ad, ARRAY_SIZE(nus_ad), NULL, 0);
+
+	if (ret == 0) {
+		LOG_INF("NUS advertising started as %s", CONFIG_BT_DEVICE_NAME);
+	} else {
+		LOG_WRN("NUS adv start failed: %d", ret);
 	}
 }
 
-static void sensor_notify_hr(uint8_t hr)
-{ sens_hr = hr; k_work_submit(&sensor_adv_work); }
-
-static void sensor_notify_spo2(uint8_t spo2_i, uint8_t spo2_f)
-{ sens_spo2_i = spo2_i; sens_spo2_f = spo2_f; k_work_submit(&sensor_adv_work); }
-
-static void sensor_notify_bat(uint8_t pct)
-{ sens_bat = pct; k_work_submit(&sensor_adv_work); }
-
-/* Periodic timer: force an adv update every 2 s even when sensor values are
- * unchanged.  Without this, a stable signal produces identical packets and
- * macOS stops delivering BleakScanner callbacks after the first one.
- */
-static void sensor_beacon_timer_fn(struct k_timer *timer)
+static void nus_start_advertising(void)
 {
-	k_work_submit(&sensor_adv_work);
+	k_work_schedule(&nus_adv_restart_work, K_MSEC(2000));
 }
 
-K_TIMER_DEFINE(sensor_beacon_timer, sensor_beacon_timer_fn, NULL);
+/* Accept all LL connection parameter update requests from the central.
+ * Without this the host rejects updates that conflict with BIS ISO
+ * scheduling, causing 0x28 "Instant Passed" disconnects.
+ */
+static bool ble_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
+{
+	return true;
+}
+
+static void ble_connected(struct bt_conn *conn, uint8_t err)
+{
+	if (!err) {
+		nus_conn = bt_conn_ref(conn);
+		LOG_INF("BLE central connected");
+	}
+}
+
+static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	if (nus_conn) {
+		bt_conn_unref(nus_conn);
+		nus_conn = NULL;
+	}
+	nus_notify_enabled = false;
+	LOG_INF("BLE central disconnected (reason %d)", reason);
+	nus_start_advertising();
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected    = ble_connected,
+	.disconnected = ble_disconnected,
+	.le_param_req = ble_le_param_req,
+};
+
+static void sensor_notify_bat(uint8_t pct)
+{
+	sens_bat = pct;
+}
 
 /**
  * @brief	Link zbus producers and observers.
@@ -769,11 +807,14 @@ K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NUL
  *       SpO2 ≈ 110 − 25 × R   (empirical linear fit, ±3 %)
  *       Emits  "O:nn.n\n"   every PPG_O2_PERIOD samples (≈ 5 s).
  *
- * Effective sample rate: 25 Hz (one FIFO read every 40 ms sleep).
+ * Raw samples arrive at PPG_RAW_FS (100 Hz FIFO output); the HR/SpO2
+ * window math below is tuned for 25 Hz, so the polling thread decimates
+ * by PPG_RAW_FS/PPG_FS before calling ppg_add().
  * All state is static (BSS), not on stack.
  * -------------------------------------------------------------------------
  */
-#define PPG_FS         25              /* effective Hz            */
+#define PPG_RAW_FS    100              /* FIFO output rate (400 Hz SR, avg 4) */
+#define PPG_FS         25              /* algorithm Hz            */
 #define PPG_WIN       200              /* 8 s sliding window      */
 #define PPG_HR_PERIOD  PPG_FS          /* emit H: every 1 s       */
 #define PPG_O2_PERIOD  PPG_FS          /* emit O: every 1 s       */
@@ -981,16 +1022,20 @@ static int ppg_spo2_x10(void)
 }
 
 /* -------------------------------------------------------------------------
- * SpO2 / PPG thread — MAX30101 FIFO at 25 Hz effective rate
+ * SpO2 / PPG thread — MAX30101 FIFO drained at 100 Hz
  * -------------------------------------------------------------------------
  */
 
 /* Set to 1 to stream raw PPG samples over RTT as CSV lines:
  *   P,<uptime_ms>,<ir>,<red>,<green>
  * Capture with log_ppg.sh (or any RTT logger) and filter lines starting
- * with "P," into a .csv.  ~25 lines/s, negligible RTT bandwidth.
+ * with "P," into a .csv.  ~100 lines/s, modest RTT bandwidth.
  */
 #define PPG_RAW_LOG 1
+
+/* NUS packet batching: 10 samples/packet → 10 notifications/s at 100 Hz */
+#define PPG_PKT_SAMPLES 10
+#define PPG_PKT_HDR     8
 
 void polling_thread_spo2(void)
 {
@@ -1003,68 +1048,111 @@ void polling_thread_spo2(void)
 		return;
 	}
 
-	uint8_t  fifo[9]; /* 3 bytes each: red, ir, green */
-	uint32_t sample_n = 0;
+	uint8_t  fifo[9];        /* 3 bytes each: red, ir, green */
+	uint32_t sample_n = 0;   /* raw samples at PPG_RAW_FS */
+	uint32_t dec_n = 0;      /* decimated samples fed to HR/SpO2 at PPG_FS */
+
+	/* NUS streaming packet: batch samples so 100 Hz becomes 10 pkt/s */
+	static uint8_t pkt[PPG_PKT_HDR + PPG_PKT_SAMPLES * 9];
+	uint8_t  pkt_n = 0;
+	uint8_t  pkt_seq = 0;
+	uint32_t last_send_warn_ms = 0;
 
 	while (1) {
-		int ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x07, fifo, 9);
+		/* FIFO_WR_PTR (0x04), OVF_COUNTER (0x05), FIFO_RD_PTR (0x06) */
+		uint8_t ptrs[3];
+		int ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x04, ptrs, 3);
 
 		if (ret) {
-			printk("FIFO read error %d\n", ret);
+			printk("FIFO ptr read error %d\n", ret);
 			k_msleep(40);
 			continue;
 		}
 
-		uint32_t red   = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
-		uint32_t ir    = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
-		uint32_t green = ((fifo[6] << 16) | (fifo[7] << 8) | fifo[8]) & 0x3FFFF;
+		int avail = (ptrs[0] - ptrs[2]) & 0x1F;
+
+		while (avail-- > 0) {
+			ret = i2c_burst_read(pulse_dev, SENSOR_ADDR, 0x07, fifo, 9);
+
+			if (ret) {
+				printk("FIFO read error %d\n", ret);
+				break;
+			}
+
+			uint32_t red   = ((fifo[0] << 16) | (fifo[1] << 8) | fifo[2]) & 0x3FFFF;
+			uint32_t ir    = ((fifo[3] << 16) | (fifo[4] << 8) | fifo[5]) & 0x3FFFF;
+			uint32_t green = ((fifo[6] << 16) | (fifo[7] << 8) | fifo[8]) & 0x3FFFF;
 
 #if PPG_RAW_LOG
-		printk("P,%u,%u,%u,%u\n", k_uptime_get_32(), ir, red, green);
+			printk("P,%u,%u,%u,%u\n", k_uptime_get_32(), ir, red, green);
 #endif
 
-		ppg_add(ir, red, green);
-		sample_n++;
+			sample_n++;
 
-		/* After this many seconds without a valid reading, zero the
-		 * beacon fields (0 = "no data") so receivers can't mistake a
-		 * stale last value for a live one.
+			/* Stream every raw sample over NUS in batched packets */
+			if (nus_conn && nus_notify_enabled) {
+				if (pkt_n == 0) {
+					sys_put_le32(k_uptime_get_32(), &pkt[4]);
+				}
+
+				uint8_t *p = &pkt[PPG_PKT_HDR + pkt_n * 9];
+
+				sys_put_le24(ir, &p[0]);
+				sys_put_le24(red, &p[3]);
+				sys_put_le24(green, &p[6]);
+				pkt_n++;
+
+				if (pkt_n == PPG_PKT_SAMPLES) {
+					pkt[0] = 'P';
+					pkt[1] = pkt_seq++;
+					pkt[2] = sens_bat;
+					pkt[3] = pkt_n;
+
+					ret = bt_nus_send(nus_conn, pkt,
+							  PPG_PKT_HDR + pkt_n * 9);
+					if (ret && ret != -ENOTCONN &&
+					    k_uptime_get_32() - last_send_warn_ms > 1000) {
+						last_send_warn_ms = k_uptime_get_32();
+						LOG_WRN("NUS send failed: %d", ret);
+					}
+					pkt_n = 0;
+				}
+			} else {
+				pkt_n = 0;
+			}
+
+			/* HR/SpO2 window math is tuned for PPG_FS (25 Hz) */
+			if (sample_n % (PPG_RAW_FS / PPG_FS) != 0) {
+				continue;
+			}
+
+			ppg_add(ir, red, green);
+			dec_n++;
+
+			if (dec_n % PPG_HR_PERIOD == 0) {
+				int hr10 = ppg_hr_bpm_x10();
+
+#if PPG_RAW_LOG
+				printk("H,%u,%d,%d\n", k_uptime_get_32(), hr10,
+				       ppg_last_qual);
+#endif
+				(void)hr10;
+			}
+
+			if (dec_n % PPG_O2_PERIOD == 0) {
+				int sp10 = ppg_spo2_x10();
+
+#if PPG_RAW_LOG
+				printk("O,%u,%d\n", k_uptime_get_32(), sp10);
+#endif
+				(void)sp10;
+			}
+		}
+
+		/* FIFO fills at 10 ms/sample; a 5 ms poll keeps the drain burst
+		 * to 1-2 samples so CSV timestamps stay close to sample time.
 		 */
-		#define PPG_STALE_SEC 10
-		static uint16_t hr_stale_s;
-		static uint16_t sp_stale_s;
-
-		if (sample_n % PPG_HR_PERIOD == 0) {
-			int hr10 = ppg_hr_bpm_x10();
-
-#if PPG_RAW_LOG
-			printk("H,%u,%d,%d\n", k_uptime_get_32(), hr10,
-			       ppg_last_qual);
-#endif
-			if (hr10 > 0) {
-				sensor_notify_hr((uint8_t)((hr10 + 5) / 10));
-				hr_stale_s = 0;
-			} else if (++hr_stale_s == PPG_STALE_SEC) {
-				sensor_notify_hr(0);
-			}
-		}
-
-		if (sample_n % PPG_O2_PERIOD == 0) {
-			int sp10 = ppg_spo2_x10();
-
-#if PPG_RAW_LOG
-			printk("O,%u,%d\n", k_uptime_get_32(), sp10);
-#endif
-			if (sp10 > 0) {
-				sensor_notify_spo2((uint8_t)(sp10 / 10),
-						   (uint8_t)(sp10 % 10));
-				sp_stale_s = 0;
-			} else if (++sp_stale_s == PPG_STALE_SEC) {
-				sensor_notify_spo2(0, 0);
-			}
-		}
-
-		k_msleep(40);
+		k_msleep(5);
 	}
 }
 
@@ -1080,7 +1168,7 @@ int main(void)
 	const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
     if (!device_is_ready(pulse_dev)) {
             printk("Pulse oximeter not ready!\n");
-            return;         
+            return -ENODEV;
     } else {
             printk("Pulse oximeter ready!\n");
     }
@@ -1089,7 +1177,8 @@ int main(void)
         // FIFO config
         i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x08, 0x4F); // avg=4, rollover
 
-        // SpO2 config: gain, sample rate 100Hz, pulse width 411 µs
+        // SpO2 config: gain, sample rate 400 Hz (100 Hz FIFO output after
+        // avg=4), pulse width 411 µs
         i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0A, 0x4F);
 
         /* LED currents: each LSB = 0.2 mA.  Tuned for NECK (reflective)
@@ -1175,26 +1264,13 @@ int main(void)
 
 	LOG_INF("Broadcast source: %s started", CONFIG_BT_AUDIO_BROADCAST_NAME);
 
-	k_timer_start(&sensor_beacon_timer, K_MSEC(4000), K_MSEC(4000));
-
-	static const struct bt_le_adv_param sensor_adv_param = {
-		.id                 = BT_ID_DEFAULT,
-		.sid                = 0U,
-		.secondary_max_skip = 0U,
-		.options            = BT_LE_ADV_OPT_NONE,
-		.interval_min       = 0x0C80U, /* 2000 ms — wider gap reduces BIS ISO conflicts */
-		.interval_max       = 0x1000U, /* 2560 ms */
-		.peer               = NULL,
-	};
-	int adv_ret = bt_le_adv_start(&sensor_adv_param,
-				       sensor_ad, ARRAY_SIZE(sensor_ad), NULL, 0);
-
-	if (adv_ret && adv_ret != -EALREADY) {
-		LOG_WRN("Sensor adv start failed: %d", adv_ret);
-	} else {
-		LOG_INF("Sensor beacon started (ADV_NONCONN_IND, 1 s) as %s",
-			CONFIG_BT_DEVICE_NAME);
+	ret = bt_nus_init(&nus_callbacks);
+	if (ret) {
+		LOG_ERR("Failed to init NUS: %d", ret);
 	}
+
+	k_work_init_delayable(&nus_adv_restart_work, nus_adv_restart_handler);
+	nus_start_advertising();
 
 	return 0;
 }

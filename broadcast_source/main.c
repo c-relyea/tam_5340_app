@@ -11,8 +11,6 @@
 #include <zephyr/zbus/zbus.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/drivers/i2c.h>
-#include <bluetooth/services/nus.h>
-
 
 #include "broadcast_source.h"
 #include "zbus_common.h"
@@ -352,116 +350,142 @@ static void bt_mgmt_evt_handler(const struct zbus_channel *chan)
 ZBUS_LISTENER_DEFINE(bt_mgmt_evt_listen, bt_mgmt_evt_handler);
 
 /* -------------------------------------------------------------------------
- * NUS (Nordic UART Service) — 100 Hz raw PPG streaming to a BLE central
+ * PPG beacon — connectionless broadcast of raw PPG samples
  *
- * The central (dataReceive.py) connects, subscribes to the NUS TX
- * characteristic, and receives binary packets of PPG_PKT_SAMPLES raw
- * samples each (10 packets/s at 100 Hz).
+ * A GATT connection never held up at usable range (the receiver's BLE
+ * radio couldn't keep it alive at distance). Raw samples are broadcast
+ * instead, riding in the AD payload of a dedicated non-connectable
+ * advertiser that any passive scanner in range can read — no connection,
+ * subscription, or supervision timeout involved.
  *
- * Packet layout (little-endian):
- *   [0]     'P'      packet type/magic
- *   [1]     seq      increments per packet — lets the receiver detect drops
- *   [2]     bat_pct  battery %  (0xFF = not yet read)
- *   [3]     count    number of samples in this packet
- *   [4..7]  uptime_ms of the first sample
- *   then count × { ir u24, red u24, green u24 }  (raw 18-bit ADC counts)
+ * A legacy (non-extended) PDU is used deliberately: BT_LE_ADV_PARAM below
+ * omits BT_LE_ADV_OPT_EXT_ADV, so any BLE 4.x-era scanner can receive it.
+ * This is not just for broad compatibility — the Raspberry Pi 5 receiver's
+ * BlueZ/controller stack does legacy-only scanning (verified with btmon:
+ * 100% "LE Advertising Report", zero "LE Extended Advertising Report", even
+ * with bluetoothd Experimental mode on), so an extended-advertising beacon
+ * is simply invisible to it. Legacy caps the payload at 31 bytes, so each
+ * beacon update carries 2 samples; broadcasting at the fastest legal
+ * non-directed interval (20 ms) targets 100 Hz (≈65-70 Hz received in
+ * practice, the rest lost to radio contention with the BIS audio broadcast).
  *
- * Needs ATT MTU ≥ 101 for a full 10-sample packet; macOS negotiates 247.
- *
- * Coexistence with the BIS broadcast on the shared radio (see git history
- * of the earlier NUS implementation):
- *  - PPCP steers macOS to a 30-50 ms connection interval, a multiple of
- *    the 10 ms BIS SDU interval
- *  - le_param_req accepts all LL parameter updates, avoiding 0x28
- *    "Instant Passed" disconnects
+ * Packet layout (manufacturer-specific AD, little-endian):
+ *   [0..1]   company_id  CONFIG_BT_DEVICE_MANUFACTURER_ID — the AD type's
+ *                         "Manufacturer Specific Data" format requires this
+ *                         as the first 2 bytes; BT_DATA_MANUFACTURER_DATA
+ *                         does not add it automatically
+ *   [2]      magic       'T' (0x54) — cheap sanity check against other
+ *                         nearby Nordic boards sharing the same placeholder
+ *                         company ID
+ *   [3]      seq         increments per beacon update (~50/s) — drop detection
+ *   [4]      bat_pct     battery %  (0xFF = not yet read)
+ *   [5..6]   sample_idx  running raw-sample counter (u16, wraps ~every 655 s)
+ *   [7..15]  sample A: { ir u24, red u24, green u24 }
+ *   [16..24] sample B: { ir u24, red u24, green u24 }
  * -------------------------------------------------------------------------
  */
-static struct bt_conn *nus_conn;
-static bool nus_notify_enabled; /* set when central writes CCCD = 0x0001 */
 static volatile uint8_t sens_bat = 0xFF;
 
-static const struct bt_data nus_ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+#define TAM_BEACON_MAGIC        'T'
+#define TAM_BEACON_PAYLOAD_LEN  23
+#define TAM_BEACON_MFG_LEN      (2 + TAM_BEACON_PAYLOAD_LEN) /* company_id + payload */
+#define TAM_BEACON_ADV_INTERVAL 0x0020 /* 20 ms in 0.625 ms units — BLE's spec minimum */
+
+static uint8_t beacon_payload[TAM_BEACON_MFG_LEN];
+
+static const struct bt_data beacon_ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
+	BT_DATA(BT_DATA_MANUFACTURER_DATA, beacon_payload, sizeof(beacon_payload)),
 };
 
-static void nus_send_enabled_cb(enum bt_nus_send_status status)
-{
-	nus_notify_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
-	LOG_INF("NUS notifications %s",
-		nus_notify_enabled ? "enabled — streaming" : "disabled");
-}
-
-static struct bt_nus_cb nus_callbacks = {
-	.send_enabled = nus_send_enabled_cb,
-};
-
-/* Delayed work to restart NUS advertising after disconnect.
- * Stop-before-start clears stale advertising state left by a 0x28
- * (Instant Passed) disconnect; without it bt_le_adv_start returns
- * -EALREADY on a dead handle and the next connection gets "No valid adv".
- * The 2 s delay lets bt_mgmt finish its own BIS adv handling first.
- */
-static struct k_work_delayable nus_adv_restart_work;
-
-static void nus_adv_restart_handler(struct k_work *work)
-{
-	(void)bt_le_adv_stop();
-
-	int ret = bt_le_adv_start(BT_LE_ADV_CONN, nus_ad, ARRAY_SIZE(nus_ad), NULL, 0);
-
-	if (ret == 0) {
-		LOG_INF("NUS advertising started as %s", CONFIG_BT_DEVICE_NAME);
-	} else {
-		LOG_WRN("NUS adv start failed: %d", ret);
-	}
-}
-
-static void nus_start_advertising(void)
-{
-	k_work_schedule(&nus_adv_restart_work, K_MSEC(2000));
-}
-
-/* Accept all LL connection parameter update requests from the central.
- * Without this the host rejects updates that conflict with BIS ISO
- * scheduling, causing 0x28 "Instant Passed" disconnects.
- */
-static bool ble_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
-{
-	return true;
-}
-
-static void ble_connected(struct bt_conn *conn, uint8_t err)
-{
-	if (!err) {
-		nus_conn = bt_conn_ref(conn);
-		LOG_INF("BLE central connected");
-	}
-}
-
-static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
-{
-	if (nus_conn) {
-		bt_conn_unref(nus_conn);
-		nus_conn = NULL;
-	}
-	nus_notify_enabled = false;
-	LOG_INF("BLE central disconnected (reason %d)", reason);
-	nus_start_advertising();
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected    = ble_connected,
-	.disconnected = ble_disconnected,
-	.le_param_req = ble_le_param_req,
-};
+static const struct bt_le_adv_param *beacon_adv_param =
+	BT_LE_ADV_PARAM(0, TAM_BEACON_ADV_INTERVAL, TAM_BEACON_ADV_INTERVAL, NULL);
 
 static void sensor_notify_bat(uint8_t pct)
 {
 	sens_bat = pct;
 }
+
+/* -------------------------------------------------------------------------
+ * PPG streaming pipeline
+ *
+ * The sampling thread (polling_thread_spo2) must never block or fault, or
+ * it stops draining the sensor FIFO and stops the RTT "P," ground-truth
+ * log.  bt_le_adv_update_data() runs the full HCI advertising-data-update
+ * exchange and can take longer than a sample period, especially with the
+ * concurrent BIS audio broadcast on the same radio, so it is NOT called
+ * from the sampling thread.  Instead the sampler drops each raw sample into
+ * a queue (non-blocking, drop-on-full) and a dedicated thread batches 2
+ * samples per beacon update and pushes them out.
+ * -------------------------------------------------------------------------
+ */
+struct ppg_sample {
+	uint32_t ir;
+	uint32_t red;
+	uint32_t green;
+};
+
+/* 64 samples ≈ 0.64 s of buffering at 100 Hz — absorbs BIS-induced gaps */
+K_MSGQ_DEFINE(ppg_msgq, sizeof(struct ppg_sample), 64, 4);
+static uint32_t ppg_stream_drops; /* samples dropped because queue was full */
+
+/* Enqueue one raw sample for the beacon.  Non-blocking: if the queue is
+ * full (radio busy with the BIS broadcast) the sample is dropped rather
+ * than stalling the sampler.  The beacon broadcasts unconditionally, so
+ * unlike a GATT notify there is no subscriber state to gate on.
+ */
+static void ppg_stream_put(uint32_t ir, uint32_t red, uint32_t green)
+{
+	struct ppg_sample s = { ir, red, green };
+
+	if (k_msgq_put(&ppg_msgq, &s, K_NO_WAIT) != 0) {
+		ppg_stream_drops++;
+	}
+}
+
+static void ppg_pack_sample(uint8_t *p, const struct ppg_sample *s)
+{
+	sys_put_le24(s->ir, &p[0]);
+	sys_put_le24(s->red, &p[3]);
+	sys_put_le24(s->green, &p[6]);
+}
+
+static void ppg_stream_thread(void)
+{
+	uint8_t  seq = 0;
+	uint16_t sample_idx = 0;
+	uint32_t last_warn_ms = 0;
+
+	sys_put_le16(CONFIG_BT_DEVICE_MANUFACTURER_ID, &beacon_payload[0]);
+
+	while (1) {
+		struct ppg_sample a, b;
+
+		if (k_msgq_get(&ppg_msgq, &a, K_FOREVER) != 0) {
+			continue;
+		}
+		if (k_msgq_get(&ppg_msgq, &b, K_FOREVER) != 0) {
+			continue;
+		}
+
+		beacon_payload[2] = TAM_BEACON_MAGIC;
+		beacon_payload[3] = seq++;
+		beacon_payload[4] = sens_bat;
+		sys_put_le16(sample_idx, &beacon_payload[5]);
+		ppg_pack_sample(&beacon_payload[7], &a);
+		ppg_pack_sample(&beacon_payload[16], &b);
+		sample_idx += 2;
+
+		int ret = bt_le_adv_update_data(beacon_ad, ARRAY_SIZE(beacon_ad), NULL, 0);
+
+		if (ret && k_uptime_get_32() - last_warn_ms > 1000) {
+			last_warn_ms = k_uptime_get_32();
+			LOG_WRN("Beacon adv update failed: %d (drops=%u)", ret, ppg_stream_drops);
+		}
+	}
+}
+
+K_THREAD_DEFINE(ppg_stream_id, 2048, ppg_stream_thread, NULL, NULL, NULL, 10, 0, 0);
 
 /**
  * @brief	Link zbus producers and observers.
@@ -813,7 +837,7 @@ K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NUL
  * All state is static (BSS), not on stack.
  * -------------------------------------------------------------------------
  */
-#define PPG_RAW_FS    100              /* FIFO output rate (400 Hz SR, avg 4) */
+#define PPG_RAW_FS    100              /* FIFO output rate (200 Hz SR, avg 2) */
 #define PPG_FS         25              /* algorithm Hz            */
 #define PPG_WIN       200              /* 8 s sliding window      */
 #define PPG_HR_PERIOD  PPG_FS          /* emit H: every 1 s       */
@@ -1033,9 +1057,87 @@ static int ppg_spo2_x10(void)
  */
 #define PPG_RAW_LOG 1
 
-/* NUS packet batching: 10 samples/packet → 10 notifications/s at 100 Hz */
-#define PPG_PKT_SAMPLES 10
-#define PPG_PKT_HDR     8
+/* Configure the MAX30101 once it responds on the bus.  Must run after
+ * nrf5340_audio_dk_init() has asserted PWR_EN — register writes to the
+ * unpowered chip fail silently and it boots into shutdown mode (no
+ * samples, FIFO never fills).  Waits for PART_ID, configures, then
+ * verifies the mode register took.
+ */
+static int max30101_configure(const struct device *i2c_dev)
+{
+	int ret;
+	uint8_t id = 0;
+
+	/* Wait for the sensor to come up on the rails (PART_ID = 0x15) */
+	for (int tries = 0; tries < 50; tries++) {
+		ret = i2c_reg_read_byte(i2c_dev, SENSOR_ADDR, 0xFF, &id);
+		if (ret == 0 && id == 0x15) {
+			break;
+		}
+		k_msleep(100);
+	}
+
+	if (id != 0x15) {
+		printk("MAX30101 not responding (PART_ID=0x%02X)\n", id);
+		return -ENODEV;
+	}
+
+	ret = 0;
+
+	// FIFO config
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x08, 0x2F); // avg=2
+
+	// SpO2 config: gain, sample rate 200 Hz, pulse width 411 µs.
+	// 200 Hz is the chip's max with 3 active LED slots at 411 µs —
+	// programming 400 Hz gets internally clipped to 200 (measured as
+	// ~50 Hz FIFO output with avg=4).  200 Hz / avg=2 → true 100 Hz.
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0A, 0x4B);
+
+	/* LED currents: each LSB = 0.2 mA.  Tuned for NECK (reflective)
+	 * placement from recorded data:
+	 * RED   0x60 = 19.2 mA  (neck DC was ~101k/262k at 16 mA — headroom)
+	 * IR    0x60 = 19.2 mA  (neck DC was ~81k/262k at 9.6 mA; SpO2 needs
+	 *                        every bit of IR/red AC SNR at 0.1-0.2 % PI)
+	 * GREEN 0x50+0x50 = 32 mA total: green is the HR channel on the neck
+	 *   (5-10x the relative pulsation of IR/red) but its DC was only
+	 *   ~4.7k/262k at 9.6 mA.  In multi-LED mode with SLOTx=011 the green
+	 *   LED sinks current from BOTH LED3_PA and LED4_PA (datasheet
+	 *   Table 9 note), so both are set.
+	 * Watch for clipping near 262143 counts if contact/coupling improves. */
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0C, 0x60); // RED   19.2 mA
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0D, 0x60); // IR    19.2 mA
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0E, 0x50); // GREEN 16.0 mA (DAC 1)
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0F, 0x50); // GREEN 16.0 mA (DAC 2)
+
+	// Multi-LED slots
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x11, 0x21); // slot1=RED, slot2=IR
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x12, 0x03); // slot3=GREEN
+
+	// Clear FIFO
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x04, 0x00);
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x05, 0x00);
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x06, 0x00);
+
+	// Enable multi-LED mode (RED+IR+GREEN)
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x09, 0x07);
+
+	if (ret) {
+		printk("MAX30101 config write failed\n");
+		return -EIO;
+	}
+
+	uint8_t mode = 0;
+
+	ret = i2c_reg_read_byte(i2c_dev, SENSOR_ADDR, 0x09, &mode);
+	if (ret || mode != 0x07) {
+		printk("MAX30101 mode verify failed (mode=0x%02X, err=%d)\n", mode, ret);
+		return -EIO;
+	}
+
+	printk("Pulse oximeter configured!\n");
+
+	return 0;
+}
 
 void polling_thread_spo2(void)
 {
@@ -1048,15 +1150,13 @@ void polling_thread_spo2(void)
 		return;
 	}
 
+	if (max30101_configure(pulse_dev)) {
+		return;
+	}
+
 	uint8_t  fifo[9];        /* 3 bytes each: red, ir, green */
 	uint32_t sample_n = 0;   /* raw samples at PPG_RAW_FS */
 	uint32_t dec_n = 0;      /* decimated samples fed to HR/SpO2 at PPG_FS */
-
-	/* NUS streaming packet: batch samples so 100 Hz becomes 10 pkt/s */
-	static uint8_t pkt[PPG_PKT_HDR + PPG_PKT_SAMPLES * 9];
-	uint8_t  pkt_n = 0;
-	uint8_t  pkt_seq = 0;
-	uint32_t last_send_warn_ms = 0;
 
 	while (1) {
 		/* FIFO_WR_PTR (0x04), OVF_COUNTER (0x05), FIFO_RD_PTR (0x06) */
@@ -1089,37 +1189,8 @@ void polling_thread_spo2(void)
 
 			sample_n++;
 
-			/* Stream every raw sample over NUS in batched packets */
-			if (nus_conn && nus_notify_enabled) {
-				if (pkt_n == 0) {
-					sys_put_le32(k_uptime_get_32(), &pkt[4]);
-				}
-
-				uint8_t *p = &pkt[PPG_PKT_HDR + pkt_n * 9];
-
-				sys_put_le24(ir, &p[0]);
-				sys_put_le24(red, &p[3]);
-				sys_put_le24(green, &p[6]);
-				pkt_n++;
-
-				if (pkt_n == PPG_PKT_SAMPLES) {
-					pkt[0] = 'P';
-					pkt[1] = pkt_seq++;
-					pkt[2] = sens_bat;
-					pkt[3] = pkt_n;
-
-					ret = bt_nus_send(nus_conn, pkt,
-							  PPG_PKT_HDR + pkt_n * 9);
-					if (ret && ret != -ENOTCONN &&
-					    k_uptime_get_32() - last_send_warn_ms > 1000) {
-						last_send_warn_ms = k_uptime_get_32();
-						LOG_WRN("NUS send failed: %d", ret);
-					}
-					pkt_n = 0;
-				}
-			} else {
-				pkt_n = 0;
-			}
+			/* Hand off to the streaming thread — never blocks here */
+			ppg_stream_put(ir, red, green);
 
 			/* HR/SpO2 window math is tuned for PPG_FS (25 Hz) */
 			if (sample_n % (PPG_RAW_FS / PPG_FS) != 0) {
@@ -1161,57 +1232,10 @@ K_THREAD_DEFINE(spo2_thread_id, 2048, polling_thread_spo2,
 
 
 int main(void)
-
-
-
 {
-	const struct device *pulse_dev = DEVICE_DT_GET(DT_NODELABEL(i2c1));
-    if (!device_is_ready(pulse_dev)) {
-            printk("Pulse oximeter not ready!\n");
-            return -ENODEV;
-    } else {
-            printk("Pulse oximeter ready!\n");
-    }
-        printk("Configuring pulse oximeter...\n");
-
-        // FIFO config
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x08, 0x4F); // avg=4, rollover
-
-        // SpO2 config: gain, sample rate 400 Hz (100 Hz FIFO output after
-        // avg=4), pulse width 411 µs
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0A, 0x4F);
-
-        /* LED currents: each LSB = 0.2 mA.  Tuned for NECK (reflective)
-         * placement from recorded data:
-         * RED   0x60 = 19.2 mA  (neck DC was ~101k/262k at 16 mA — headroom)
-         * IR    0x60 = 19.2 mA  (neck DC was ~81k/262k at 9.6 mA; SpO2 needs
-         *                        every bit of IR/red AC SNR at 0.1-0.2 % PI)
-         * GREEN 0x50+0x50 = 32 mA total: green is the HR channel on the neck
-         *   (5-10x the relative pulsation of IR/red) but its DC was only
-         *   ~4.7k/262k at 9.6 mA.  In multi-LED mode with SLOTx=011 the green
-         *   LED sinks current from BOTH LED3_PA and LED4_PA (datasheet
-         *   Table 9 note), so both are set.
-         * Watch for clipping near 262143 counts if contact/coupling improves. */
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0C, 0x60); // RED   19.2 mA
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0D, 0x60); // IR    19.2 mA
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0E, 0x50); // GREEN 16.0 mA (DAC 1)
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x0F, 0x50); // GREEN 16.0 mA (DAC 2)
-
-        // *** MULTI-LED SLOTS (THIS WAS MISSING!) ***
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x11, 0x21); // slot1=RED, slot2=IR
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x12, 0x03); // slot3=GREEN
-
-        // Clear FIFO
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x04, 0x00);
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x05, 0x00);
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x06, 0x00);
-
-        // Enable multi-LED mode (RED+IR+GREEN)
-        i2c_reg_write_byte(pulse_dev, SENSOR_ADDR, 0x09, 0x07);
-
-
-    printk("Pulse oximeter configured!\n");
-
+	/* The MAX30101 is configured in polling_thread_spo2 once PWR_EN
+	 * rails are up — see max30101_configure().
+	 */
 	int ret;
 	static struct broadcast_source_big broadcast_param;
 
@@ -1264,13 +1288,12 @@ int main(void)
 
 	LOG_INF("Broadcast source: %s started", CONFIG_BT_AUDIO_BROADCAST_NAME);
 
-	ret = bt_nus_init(&nus_callbacks);
+	ret = bt_le_adv_start(beacon_adv_param, beacon_ad, ARRAY_SIZE(beacon_ad), NULL, 0);
 	if (ret) {
-		LOG_ERR("Failed to init NUS: %d", ret);
+		LOG_ERR("Failed to start PPG beacon: %d", ret);
+	} else {
+		LOG_INF("PPG beacon advertising started");
 	}
-
-	k_work_init_delayable(&nus_adv_restart_work, nus_adv_restart_handler);
-	nus_start_advertising();
 
 	return 0;
 }

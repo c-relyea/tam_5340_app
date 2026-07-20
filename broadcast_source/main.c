@@ -820,233 +820,10 @@ static void polling_thread_battery(void)
 K_THREAD_DEFINE(battery_thread_id, 1024, polling_thread_battery, NULL, NULL, NULL, 13, 0, 0);
 
 /* -------------------------------------------------------------------------
- * On-chip HR / SpO2 computation
+ * PPG thread — MAX30101 FIFO drained at 100 Hz
  *
- * HR:   Peak detection on DC-removed IR signal.
- *       Rolling mean of last 8 RR intervals → BPM.
- *       Emits  "H:nn\n"     every PPG_FS samples (≈ 1 s).
- *
- * SpO2: Ratio-of-ratios over a 5 s sliding window.
- *       R = (AC_red / DC_red) / (AC_ir / DC_ir)
- *       SpO2 ≈ 110 − 25 × R   (empirical linear fit, ±3 %)
- *       Emits  "O:nn.n\n"   every PPG_O2_PERIOD samples (≈ 5 s).
- *
- * Raw samples arrive at PPG_RAW_FS (100 Hz FIFO output); the HR/SpO2
- * window math below is tuned for 25 Hz, so the polling thread decimates
- * by PPG_RAW_FS/PPG_FS before calling ppg_add().
- * All state is static (BSS), not on stack.
- * -------------------------------------------------------------------------
- */
-#define PPG_RAW_FS    100              /* FIFO output rate (200 Hz SR, avg 2) */
-#define PPG_FS         25              /* algorithm Hz            */
-#define PPG_WIN       200              /* 8 s sliding window      */
-#define PPG_HR_PERIOD  PPG_FS          /* emit H: every 1 s       */
-#define PPG_O2_PERIOD  PPG_FS          /* emit O: every 1 s       */
-
-/* Autocorrelation lag range: 8..38 ticks @ 25 Hz = 187..39 bpm */
-#define PPG_LAG_MIN     8
-#define PPG_LAG_MAX    38
-/* Minimum normalized autocorrelation (×1024) to accept an HR lock.
- * Neck recordings with good contact score 700-900; noise scores < 200.
- */
-#define PPG_MIN_QUAL  300
-/* Minimum DC level (counts) on IR and red to consider skin contact.
- * Air reads < 1500; skin contact reads > 50000.
- */
-#define PPG_MIN_DC  20000
-
-static int32_t  ppg_ir_win[PPG_WIN];
-static int32_t  ppg_red_win[PPG_WIN];
-static int32_t  ppg_grn_win[PPG_WIN];
-static uint16_t ppg_win_head;
-static uint16_t ppg_win_n;
-
-/* Scratch (static: keep off the 2 KB thread stack) */
-static int32_t ppg_lin[PPG_WIN];
-static int32_t ppg_det[PPG_WIN];
-static int64_t ppg_ps[PPG_WIN + 1];
-
-/* Quality (×1024) of the most recent HR lock; SpO2 requires a locked HR */
-static int32_t ppg_last_qual;
-
-static void ppg_add(uint32_t ir_raw, uint32_t red_raw, uint32_t grn_raw)
-{
-	ppg_ir_win[ppg_win_head]  = (int32_t)ir_raw;
-	ppg_red_win[ppg_win_head] = (int32_t)red_raw;
-	ppg_grn_win[ppg_win_head] = (int32_t)grn_raw;
-	ppg_win_head = (ppg_win_head + 1) % PPG_WIN;
-	if (ppg_win_n < PPG_WIN) {
-		ppg_win_n++;
-	}
-}
-
-/* Copy a circular window into ppg_lin[] in time order, then remove the
- * baseline with a centered 1 s moving average: ppg_det[] = signal - trend.
- * Also returns the window mean (DC level).
- */
-static int32_t ppg_detrend(const int32_t *win)
-{
-	const int half = PPG_FS / 2;
-
-	for (int i = 0; i < PPG_WIN; i++) {
-		ppg_lin[i] = win[(ppg_win_head + i) % PPG_WIN];
-	}
-
-	ppg_ps[0] = 0;
-	for (int i = 0; i < PPG_WIN; i++) {
-		ppg_ps[i + 1] = ppg_ps[i] + ppg_lin[i];
-	}
-
-	for (int i = 0; i < PPG_WIN; i++) {
-		int lo = MAX(0, i - half);
-		int hi = MIN(PPG_WIN - 1, i + half);
-		int32_t ma = (int32_t)((ppg_ps[hi + 1] - ppg_ps[lo]) / (hi - lo + 1));
-
-		ppg_det[i] = ppg_lin[i] - ma;
-	}
-
-	return (int32_t)(ppg_ps[PPG_WIN] / PPG_WIN);
-}
-
-static uint32_t ppg_isqrt64(uint64_t v)
-{
-	uint64_t r = 0;
-	uint64_t bit = 1ULL << 62;
-
-	while (bit > v) {
-		bit >>= 2;
-	}
-	while (bit) {
-		if (v >= r + bit) {
-			v -= r + bit;
-			r = (r >> 1) + bit;
-		} else {
-			r >>= 1;
-		}
-		bit >>= 2;
-	}
-	return (uint32_t)r;
-}
-
-/* Heart rate from autocorrelation of the detrended GREEN channel.
- * Green has 5-10x the relative pulsation of IR/red in reflective
- * (neck/wrist) placement, so it is the HR channel of choice.
- * Returns bpm ×10, or 0 if no confident lock.  Updates ppg_last_qual.
- */
-static int ppg_hr_bpm_x10(void)
-{
-	ppg_last_qual = 0;
-
-	if (ppg_win_n < PPG_WIN) {
-		return 0;
-	}
-
-	(void)ppg_detrend(ppg_grn_win);
-
-	int64_t energy = 0;
-
-	for (int i = 0; i < PPG_WIN; i++) {
-		energy += (int64_t)ppg_det[i] * ppg_det[i];
-	}
-	if (energy == 0) {
-		return 0;
-	}
-
-	int32_t r_at[PPG_LAG_MAX + 2] = { 0 };
-	int best_lag = 0;
-	int32_t best_r = 0;
-
-	for (int lag = PPG_LAG_MIN; lag <= PPG_LAG_MAX; lag++) {
-		int64_t s = 0;
-
-		for (int i = 0; i < PPG_WIN - lag; i++) {
-			s += (int64_t)ppg_det[i] * ppg_det[i + lag];
-		}
-		r_at[lag] = (int32_t)((1024 * s) / energy);
-		if (r_at[lag] > best_r) {
-			best_r = r_at[lag];
-			best_lag = lag;
-		}
-	}
-
-	if (best_r < PPG_MIN_QUAL) {
-		return 0;
-	}
-
-	/* Harmonic guard: if the half-lag (double rate) correlates almost as
-	 * well, the true beat is the faster one.
-	 */
-	int L = best_lag;
-
-	if (L / 2 >= PPG_LAG_MIN && 10 * r_at[L / 2] >= 7 * best_r) {
-		L = L / 2;
-		best_r = r_at[L];
-	}
-
-	/* Parabolic interpolation around the peak, Q8 sub-lag resolution */
-	int32_t r1 = (L - 1 >= PPG_LAG_MIN) ? r_at[L - 1] : 0;
-	int32_t r2 = r_at[L];
-	int32_t r3 = (L + 1 <= PPG_LAG_MAX) ? r_at[L + 1] : 0;
-	int32_t den = r1 - 2 * r2 + r3;
-	int32_t delta_q8 = den ? (128 * (r1 - r3)) / (2 * den) : 0;
-
-	delta_q8 = CLAMP(delta_q8, -128, 128);
-
-	ppg_last_qual = best_r;
-
-	/* bpm ×10 = 60*FS*10 / (L + delta/256) */
-	return (int)((15000 * 2560) / (L * 256 + delta_q8) / 10);
-}
-
-/* SpO2 from RMS ratio-of-ratios over the same 8 s window.
- * R = (ACrms_red/DC_red) / (ACrms_ir/DC_ir);  SpO2 = 110 - 25R.
- * Only emitted with skin contact (DC floor), measurable IR perfusion,
- * and a currently locked HR (cardiac signal present).
- * Returns SpO2 ×10 (700..1000) or 0.
- */
-static int ppg_spo2_x10(void)
-{
-	if (ppg_win_n < PPG_WIN || ppg_last_qual < PPG_MIN_QUAL) {
-		return 0;
-	}
-
-	int32_t dc_ir = ppg_detrend(ppg_ir_win);
-	int64_t e_ir = 0;
-
-	for (int i = 0; i < PPG_WIN; i++) {
-		e_ir += (int64_t)ppg_det[i] * ppg_det[i];
-	}
-
-	int32_t dc_red = ppg_detrend(ppg_red_win);
-	int64_t e_red = 0;
-
-	for (int i = 0; i < PPG_WIN; i++) {
-		e_red += (int64_t)ppg_det[i] * ppg_det[i];
-	}
-
-	int32_t ac_ir  = (int32_t)ppg_isqrt64((uint64_t)(e_ir / PPG_WIN));
-	int32_t ac_red = (int32_t)ppg_isqrt64((uint64_t)(e_red / PPG_WIN));
-
-	if (dc_ir < PPG_MIN_DC || dc_red < PPG_MIN_DC || ac_ir == 0) {
-		return 0;
-	}
-
-	/* IR perfusion index ×10000; require >= 0.03% */
-	int32_t pi_ir = (int32_t)((10000LL * ac_ir) / dc_ir);
-
-	if (pi_ir < 3) {
-		return 0;
-	}
-
-	int32_t R1000 = (int32_t)(((int64_t)ac_red * dc_ir * 1000) /
-				  ((int64_t)dc_red * ac_ir));
-	int32_t sp10 = 1100 - (25 * R1000) / 100;
-
-	return (sp10 >= 700 && sp10 <= 1000) ? sp10 : 0;
-}
-
-/* -------------------------------------------------------------------------
- * SpO2 / PPG thread — MAX30101 FIFO drained at 100 Hz
+ * The board only samples and streams raw IR/red/green; all HR/SpO2 (and
+ * any other) analysis is done downstream at the sink.
  * -------------------------------------------------------------------------
  */
 
@@ -1154,9 +931,7 @@ void polling_thread_spo2(void)
 		return;
 	}
 
-	uint8_t  fifo[9];        /* 3 bytes each: red, ir, green */
-	uint32_t sample_n = 0;   /* raw samples at PPG_RAW_FS */
-	uint32_t dec_n = 0;      /* decimated samples fed to HR/SpO2 at PPG_FS */
+	uint8_t fifo[9];        /* 3 bytes each: red, ir, green */
 
 	while (1) {
 		/* FIFO_WR_PTR (0x04), OVF_COUNTER (0x05), FIFO_RD_PTR (0x06) */
@@ -1187,37 +962,11 @@ void polling_thread_spo2(void)
 			printk("P,%u,%u,%u,%u\n", k_uptime_get_32(), ir, red, green);
 #endif
 
-			sample_n++;
-
-			/* Hand off to the streaming thread — never blocks here */
+			/* Hand off to the streaming thread — never blocks here.
+			 * All HR/SpO2 analysis happens at the sink from this raw
+			 * stream; the board does no on-chip vitals computation.
+			 */
 			ppg_stream_put(ir, red, green);
-
-			/* HR/SpO2 window math is tuned for PPG_FS (25 Hz) */
-			if (sample_n % (PPG_RAW_FS / PPG_FS) != 0) {
-				continue;
-			}
-
-			ppg_add(ir, red, green);
-			dec_n++;
-
-			if (dec_n % PPG_HR_PERIOD == 0) {
-				int hr10 = ppg_hr_bpm_x10();
-
-#if PPG_RAW_LOG
-				printk("H,%u,%d,%d\n", k_uptime_get_32(), hr10,
-				       ppg_last_qual);
-#endif
-				(void)hr10;
-			}
-
-			if (dec_n % PPG_O2_PERIOD == 0) {
-				int sp10 = ppg_spo2_x10();
-
-#if PPG_RAW_LOG
-				printk("O,%u,%d\n", k_uptime_get_32(), sp10);
-#endif
-				(void)sp10;
-			}
 		}
 
 		/* FIFO fills at 10 ms/sample; a 5 ms poll keeps the drain burst

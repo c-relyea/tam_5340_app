@@ -32,6 +32,13 @@
 #define BQ27427_REG_SOC  0x1C  /* State of Charge, 2-byte LE, units: %  */
 #define BQ27427_REG_VOLT 0x04  /* Voltage,          2-byte LE, units: mV */
 
+/* The charger never reaches its own current-based termination: LED and
+ * radio current peaks keep the average draw above the charger's ~10 %
+ * termination threshold. Terminate charging in FW once SOC reaches the
+ * 80-90 % target band instead.
+ */
+#define CHG_TERM_SOC_PCT 80
+
 /* LSM6DSV16X IMU — I2C addr 0x6A */
 #define LSM6DSV16X_ADDR         0x6A
 #define LSM6DSV16X_REG_WHO_AM_I 0x0F  /* Should read 0x71                       */
@@ -811,6 +818,7 @@ static void polling_thread_battery(void)
 
 			printk("Battery: %d%%\n", soc);
 			sensor_notify_bat((uint8_t)soc);
+			tam_board_chg_term_set(soc >= CHG_TERM_SOC_PCT);
 		}
 
 		k_msleep(10000); /* every 10 s — SOC changes slowly */

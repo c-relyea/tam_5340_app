@@ -19,6 +19,15 @@ LOG_MODULE_REGISTER(tam_board, CONFIG_MODULE_NRF5340_AUDIO_DK_LOG_LEVEL);
 
 /* PWR_EN (P1.07) enables 1V8, 1V2, and 5V rails for CS47L63, mics, and sensors */
 #define PWR_EN_PIN 7
+
+/* CHG_TERM (P1.05) gates the charger's charge-termination FET. Left
+ * unconfigured (floating input) it eventually latches HIGH from parasitic
+ * leakage into the FET's high-impedance gate, terminating charging
+ * prematurely. Drive it LOW at boot so charging is enabled by default;
+ * HIGH disables charging (see tam_board_chg_term_set()).
+ */
+#define CHG_TERM_PIN 5
+
 static const struct device *gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
 static int channel_assign_check(void)
@@ -69,6 +78,12 @@ int nrf5340_audio_dk_init(void)
 	LOG_INF("PWR_EN asserted - waiting for power rails");
 	k_sleep(K_MSEC(150));
 
+	ret = gpio_pin_configure(gpio1_dev, CHG_TERM_PIN, GPIO_OUTPUT_LOW);
+	if (ret) {
+		LOG_ERR("Failed to set CHG_TERM: %d", ret);
+		return ret;
+	}
+
 	ret = led_init();
 	if (ret) {
 		LOG_ERR("Failed to initialize LED module");
@@ -95,4 +110,9 @@ int nrf5340_audio_dk_init(void)
 	}
 
 	return 0;
+}
+
+int tam_board_chg_term_set(bool terminate)
+{
+	return gpio_pin_set(gpio1_dev, CHG_TERM_PIN, terminate ? 1 : 0);
 }

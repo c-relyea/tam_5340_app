@@ -880,16 +880,23 @@ static int max30101_configure(const struct device *i2c_dev)
 
 	/* LED currents: each LSB = 0.2 mA.  Tuned for NECK (reflective)
 	 * placement from recorded data:
-	 * RED   0x60 = 19.2 mA  (neck DC was ~101k/262k at 16 mA — headroom)
-	 * IR    0x60 = 19.2 mA  (neck DC was ~81k/262k at 9.6 mA; SpO2 needs
-	 *                        every bit of IR/red AC SNR at 0.1-0.2 % PI)
+	 * RED   0x80 = 25.6 mA  (was 0x60/19.2 mA -> neck DC ~146k/262k, 56%.
+	 *                        Bumped 1.33x for SpO2: red is the SNR-limiting
+	 *                        channel (PI ~0.017 %, AC ~25 counts, marginal
+	 *                        vs the ADC/electronic noise floor).  This lifts
+	 *                        red AC counts above noise so the measured R is
+	 *                        less noise-biased.  NOTE: R itself is intensity-
+	 *                        independent (ratio of AC/DC ratios) — the win is
+	 *                        SNR, not moving true R.  DC now ~195k/262k (74%);
+	 *                        watch for clipping near 262143 if contact improves.)
+	 * IR    0x60 = 19.2 mA  (neck DC ~175k/262k, 67%; already 4x the red AC
+	 *                        SNR, and less DC headroom, so left as-is.)
 	 * GREEN 0x50+0x50 = 32 mA total: green is the HR channel on the neck
 	 *   (5-10x the relative pulsation of IR/red) but its DC was only
 	 *   ~4.7k/262k at 9.6 mA.  In multi-LED mode with SLOTx=011 the green
 	 *   LED sinks current from BOTH LED3_PA and LED4_PA (datasheet
-	 *   Table 9 note), so both are set.
-	 * Watch for clipping near 262143 counts if contact/coupling improves. */
-	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0C, 0x60); // RED   19.2 mA
+	 *   Table 9 note), so both are set. */
+	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0C, 0x80); // RED   25.6 mA
 	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0D, 0x60); // IR    19.2 mA
 	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0E, 0x50); // GREEN 16.0 mA (DAC 1)
 	ret |= i2c_reg_write_byte(i2c_dev, SENSOR_ADDR, 0x0F, 0x50); // GREEN 16.0 mA (DAC 2)

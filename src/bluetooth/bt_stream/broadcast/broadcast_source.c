@@ -701,6 +701,16 @@ void broadcast_source_default_create(struct broadcast_source_big *broadcast_para
 
 	subgroups.group_lc3_preset = lc3_preset;
 
+	/* Override just the ISO retransmit count from CONFIG_BT_AUDIO_RETRANSMITS.
+	 * The fixed BAP preset (e.g. 16_2_1) hardcodes RTN=2; that Kconfig is only
+	 * consulted by the CONFIGURABLE preset. We drive it here so RTN is tunable
+	 * WITHOUT switching presets (which would also flip sample-rate/frame-dur
+	 * defaults). Fewer retransmits = fewer BIG subevents = less radio time, so
+	 * the concurrent connectionless PPG beacon loses fewer advertising slots.
+	 * (Same field Nordic's nrf_auraconfig sets: group_lc3_preset.qos.rtn.)
+	 */
+	subgroups.group_lc3_preset.qos.rtn = CONFIG_BT_AUDIO_RETRANSMITS;
+
 	subgroups.num_bises = 2;
 	subgroups.context = BT_AUDIO_CONTEXT_TYPE_MEDIA;
 

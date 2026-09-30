@@ -7,6 +7,8 @@
 target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/audio_i2s.c)
 target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/audio_usb.c)
 target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/button_handler.c)
+target_sources_ifdef(CONFIG_BUTTON_SCAN app PRIVATE
+                     ${CMAKE_CURRENT_SOURCE_DIR}/button_scan.c)
 target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/led.c)
 target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/audio_sync_timer.c)
 

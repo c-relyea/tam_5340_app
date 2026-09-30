@@ -90,10 +90,19 @@ int nrf5340_audio_dk_init(void)
 		return ret;
 	}
 
-	ret = button_handler_init();
-	if (ret) {
-		LOG_ERR("Failed to initialize button handler");
-		return ret;
+	/* The pin scanner drives pulls on every unclaimed GPIO, including the
+	 * five the button handler watches. Arming GPIOTE on those pins as well
+	 * turns each scan cycle into a burst of spurious button interrupts, so
+	 * the two cannot run together. The scanner wins while it is enabled.
+	 */
+	if (IS_ENABLED(CONFIG_BUTTON_SCAN_AT_BOOT)) {
+		LOG_WRN("Button handler disabled: pin scan owns the GPIOs");
+	} else {
+		ret = button_handler_init();
+		if (ret) {
+			LOG_ERR("Failed to initialize button handler");
+			return ret;
+		}
 	}
 
 	ret = channel_assign_check();

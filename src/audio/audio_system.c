@@ -46,9 +46,41 @@ static struct k_poll_event encoder_evt =
 	K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &encoder_sig);
 
 static struct sw_codec_config sw_codec_cfg;
-/* Buffer which can hold max 1 period test tone at 1000 Hz */
-static int16_t test_tone_buf[CONFIG_AUDIO_SAMPLE_RATE_HZ / 1000];
+/* One period of the lowest tone tone_gen will produce (100 Hz). It writes the
+ * whole period before returning, so the buffer has to fit the worst case up
+ * front -- the caller's size check afterwards is too late to prevent an
+ * overrun. At 16 kHz this is 160 samples; the old 1 kHz sizing was 16, which
+ * a 440 Hz tone (36 samples) would have overflowed.
+ */
+static int16_t test_tone_buf[CONFIG_AUDIO_SAMPLE_RATE_HZ / 100];
 static size_t test_tone_size;
+
+/* What the encoder currently feeds into the stream. */
+static enum audio_system_src src_mode = CONFIG_AUDIO_SRC_DEFAULT;
+
+/* xorshift32. No libc dependency, no state to allocate, and statistically
+ * far better than it needs to be for an audible noise source.
+ */
+static uint32_t noise_rand(void)
+{
+	static uint32_t state = 0x1a2b3c4du;
+
+	state ^= state << 13;
+	state ^= state >> 17;
+	state ^= state << 5;
+
+	return state;
+}
+
+/* Full-scale white noise is unpleasant and clips the codec, so back it off.
+ * Shifting keeps this to one instruction per sample in the encoder path.
+ */
+static void noise_fill(int16_t *dst, size_t samples)
+{
+	for (size_t i = 0; i < samples; i++) {
+		dst[i] = (int16_t)(noise_rand() >> 16) >> CONFIG_AUDIO_TEST_NOISE_SHIFT;
+	}
+}
 
 static bool sample_rate_valid(uint32_t sample_rate_hz)
 {
@@ -141,16 +173,25 @@ static void encoder_thread(void *arg1, void *arg2, void *arg3)
 		}
 
 		if (sw_codec_cfg.encoder.enabled) {
-			if (test_tone_size) {
-				/* Test tone takes over audio stream */
+			enum audio_system_src src = src_mode;
+
+			if (src != AUDIO_SYSTEM_SRC_MIC) {
+				/* The synthetic sources replace the mic input
+				 * rather than mixing into it.
+				 */
 				uint32_t num_bytes;
-				char tmp[FRAME_SIZE_BYTES / 2];
+				int16_t tmp[(FRAME_SIZE_BYTES / 2) / sizeof(int16_t)];
 
-				ret = contin_array_create(tmp, FRAME_SIZE_BYTES / 2, test_tone_buf,
-							  test_tone_size, &test_tone_finite_pos);
-				ERR_CHK(ret);
+				if (src == AUDIO_SYSTEM_SRC_TONE) {
+					ret = contin_array_create(tmp, sizeof(tmp), test_tone_buf,
+								  test_tone_size,
+								  &test_tone_finite_pos);
+					ERR_CHK(ret);
+				} else {
+					noise_fill(tmp, ARRAY_SIZE(tmp));
+				}
 
-				ret = pscm_copy_pad(tmp, FRAME_SIZE_BYTES / 2,
+				ret = pscm_copy_pad((char *)tmp, sizeof(tmp),
 						    CONFIG_AUDIO_BIT_DEPTH_BITS, pcm_raw_data,
 						    &num_bytes);
 				ERR_CHK(ret);
@@ -193,7 +234,8 @@ void audio_system_encoder_stop(void)
 	k_poll_signal_reset(&encoder_sig);
 }
 
-int audio_system_encode_test_tone_set(uint32_t freq)
+/* Fill the tone buffer only. Source selection is the caller's business. */
+static int tone_buf_set(uint32_t freq)
 {
 	int ret;
 
@@ -212,10 +254,86 @@ int audio_system_encode_test_tone_set(uint32_t freq)
 	}
 
 	if (test_tone_size > sizeof(test_tone_buf)) {
+		test_tone_size = 0;
 		return -ENOMEM;
 	}
 
 	return 0;
+}
+
+int audio_system_encode_test_tone_set(uint32_t freq)
+{
+	int ret = tone_buf_set(freq);
+
+	if (ret) {
+		return ret;
+	}
+
+	/* Keep the legacy on/off entry point in step with the source mode,
+	 * so callers that only know about tones still work.
+	 */
+	src_mode = freq ? AUDIO_SYSTEM_SRC_TONE : AUDIO_SYSTEM_SRC_MIC;
+
+	return 0;
+}
+
+const char *audio_system_src_name(enum audio_system_src src)
+{
+	switch (src) {
+	case AUDIO_SYSTEM_SRC_TONE:
+		return "test tone";
+	case AUDIO_SYSTEM_SRC_NOISE:
+		return "white noise";
+	case AUDIO_SYSTEM_SRC_MIC:
+		return "microphone";
+	default:
+		return "unknown";
+	}
+}
+
+int audio_system_encode_src_set(enum audio_system_src src)
+{
+	int ret;
+
+	switch (src) {
+	case AUDIO_SYSTEM_SRC_TONE:
+		ret = tone_buf_set(CONFIG_AUDIO_TEST_TONE_HZ);
+		if (ret) {
+			LOG_ERR("Failed to generate %d Hz tone: %d",
+				CONFIG_AUDIO_TEST_TONE_HZ, ret);
+			return ret;
+		}
+		LOG_INF("Audio source: %d Hz test tone", CONFIG_AUDIO_TEST_TONE_HZ);
+		break;
+
+	case AUDIO_SYSTEM_SRC_NOISE:
+		LOG_INF("Audio source: white noise");
+		break;
+
+	case AUDIO_SYSTEM_SRC_MIC:
+		LOG_INF("Audio source: microphone");
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	src_mode = src;
+
+	return 0;
+}
+
+enum audio_system_src audio_system_encode_src_step(void)
+{
+	enum audio_system_src next = (src_mode + 1) % AUDIO_SYSTEM_SRC_CNT;
+
+	if (audio_system_encode_src_set(next) != 0) {
+		/* Never leave the stream on a source that failed to start. */
+		next = AUDIO_SYSTEM_SRC_MIC;
+		(void)audio_system_encode_src_set(next);
+	}
+
+	return next;
 }
 
 int audio_system_encode_test_tone_step(void)

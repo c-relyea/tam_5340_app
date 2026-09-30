@@ -157,6 +157,54 @@ config AUDIO_TEST_TONE
 	  instead of doing a user defined action.
 	  The test tone is generated on the device itself.
 
+config AUDIO_TEST_TONE_HZ
+	int "Test tone frequency"
+	depends on AUDIO_TEST_TONE
+	default 440
+	range 100 10000
+	help
+	  Frequency of the sine the encoder substitutes for the microphone
+	  in the test tone source. The tone buffer holds one period at
+	  100 Hz, so anything in range fits.
+
+config AUDIO_TEST_NOISE_SHIFT
+	int "White noise attenuation, in halvings"
+	depends on AUDIO_TEST_TONE
+	default 2
+	range 0 8
+	help
+	  Right shift applied to each noise sample. 0 is full scale, which
+	  clips and is unpleasant; 2 is about -12 dBFS.
+
+choice
+	prompt "Audio source at boot"
+	depends on AUDIO_TEST_TONE
+	default AUDIO_SRC_DEFAULT_MIC
+	help
+	  What the encoder sends before the button is pressed. The button
+	  cycles test tone -> white noise -> microphone from here.
+
+config AUDIO_SRC_DEFAULT_TONE
+	bool "Test tone"
+
+config AUDIO_SRC_DEFAULT_NOISE
+	bool "White noise"
+
+config AUDIO_SRC_DEFAULT_MIC
+	bool "Microphone"
+
+endchoice
+
+config AUDIO_SRC_DEFAULT
+	int
+	depends on AUDIO_TEST_TONE
+	default 0 if AUDIO_SRC_DEFAULT_TONE
+	default 1 if AUDIO_SRC_DEFAULT_NOISE
+	default 2
+	help
+	  Numeric form of the boot source choice, matching enum
+	  audio_system_src. Not intended to be set directly.
+
 config AUDIO_MUTE
 	bool "Mute instead of doing user defined action"
 	default y

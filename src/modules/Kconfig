@@ -12,6 +12,68 @@ config BUTTON_DEBOUNCE_MS
 	int "Button debounce time in ms"
 	default 50
 
+config BUTTON_SCAN
+	bool "Build the unknown-button pin scanner"
+	default n
+	help
+	  Adds the btnscan shell command, which configures every GPIO not
+	  claimed by a peripheral as an input and reports any pin that
+	  changes level. Used to find which pin a push button is wired to
+	  when the devicetree button nodes do not match the hardware.
+
+if BUTTON_SCAN
+
+config BUTTON_SCAN_AT_BOOT
+	bool "Run a pin scan continuously from boot"
+	default n
+	help
+	  Starts a scan shortly after boot and loops until reset, so the
+	  button can simply be held down without typing a command first.
+	  Results are also left in button_scan_last for SWD readout.
+
+config BUTTON_SCAN_BOOT_DELAY_MS
+	int "Delay before the boot scan starts"
+	depends on BUTTON_SCAN_AT_BOOT
+	default 3000
+	help
+	  Gives the rest of init time to claim its peripheral pins before
+	  the scanner decides which pins are free.
+
+config BUTTON_SCAN_DURATION_MS
+	int "Scan duration for the btnscan shell command"
+	default 20000
+
+config BUTTON_SCAN_PERIOD_MS
+	int "Delay between scan cycles"
+	default 250
+
+config BUTTON_SCAN_HEARTBEAT_MS
+	int "Reprint the full pin state this often, even if unchanged"
+	default 5000
+	help
+	  Without this a scan that finds nothing is indistinguishable from
+	  a scan thread that has died.
+
+config BUTTON_SCAN_FOCUS
+	bool "Also probe one known pin under every pull setting"
+	default n
+	help
+	  Reads a single pin with no pull, a pull-up and a pull-down on each
+	  heartbeat. Distinguishes a pin held to ground from one that simply
+	  floats, and from one that is not acting as a GPIO at all.
+
+# Not gated on BUTTON_SCAN_FOCUS: focus_probe() is compiled whenever the
+# scanner is, so these have to resolve even when the probe is disabled.
+config BUTTON_SCAN_FOCUS_PORT
+	int "Focus probe port (0 = P0, 1 = P1)"
+	default 0
+
+config BUTTON_SCAN_FOCUS_PIN
+	int "Focus probe pin"
+	default 0
+
+endif # BUTTON_SCAN
+
 config AUDIO_SYNC_TIMER_USES_RTC
 	bool
 	default y
@@ -72,6 +134,10 @@ source "subsys/logging/Kconfig.template.log_config"
 
 module = MODULE_BUTTON_HANDLER
 module-str = module-button-handler
+source "subsys/logging/Kconfig.template.log_config"
+
+module = MODULE_BUTTON_SCAN
+module-str = module-button-scan
 source "subsys/logging/Kconfig.template.log_config"
 
 module = MODULE_HW_CODEC

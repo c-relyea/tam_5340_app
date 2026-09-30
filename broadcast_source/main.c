@@ -163,7 +163,7 @@ static void button_msg_sub_thread(void)
 
 		if (msg.button_action != BUTTON_PRESS) {
 			LOG_WRN("Unhandled button action");
-			return;
+			continue;
 		}
 
 		switch (msg.button_pin) {
@@ -186,28 +186,16 @@ static void button_msg_sub_thread(void)
 
 		case BUTTON_4:
 			if (IS_ENABLED(CONFIG_AUDIO_TEST_TONE)) {
-				static bool test_tone_active;
+				enum audio_system_src src;
 
-				if (strm_state != STATE_STREAMING) {
-					LOG_INF("BUTTON_4: not streaming (state=%d)", strm_state);
-					break;
-				}
-
-				test_tone_active = !test_tone_active;
-
-				if (test_tone_active) {
-					ret = audio_system_encode_test_tone_step();
-				} else {
-					ret = audio_system_encode_test_tone_set(0);
-					LOG_INF("Test tone OFF");
-				}
-
-				if (ret) {
-					LOG_WRN("Failed to set test tone: %d", ret);
-					test_tone_active = false;
-				}
-
-				break;
+				/* Deliberately not gated on STATE_STREAMING:
+				 * the source applies to whatever the encoder
+				 * sends next, so switching while paused is
+				 * harmless and takes effect on resume.
+				 */
+				src = audio_system_encode_src_step();
+				LOG_INF("BUTTON_4: audio source now %s",
+					audio_system_src_name(src));
 			}
 
 			break;
@@ -1281,6 +1269,16 @@ int main(void)
 		bt_audio_codec_cfg_freq_to_freq_hz(CONFIG_BT_AUDIO_PREF_SAMPLE_RATE_VALUE),
 		CONFIG_BT_AUDIO_BITRATE_BROADCAST_SRC, VALUE_NOT_SET);
 	ERR_CHK_MSG(ret, "Failed to set sample- and bitrate");
+
+	if (IS_ENABLED(CONFIG_AUDIO_TEST_TONE)) {
+		/* Non-fatal: a source that will not start must not stop the
+		 * gateway from coming up.
+		 */
+		ret = audio_system_encode_src_set(CONFIG_AUDIO_SRC_DEFAULT);
+		if (ret) {
+			LOG_WRN("Failed to select boot audio source: %d", ret);
+		}
+	}
 
 	/* Get advertising set for BIG0 */
 	ret = ext_adv_populate(0, &ext_adv_data[0], ext_adv_buf[0], ARRAY_SIZE(ext_adv_buf[0]),

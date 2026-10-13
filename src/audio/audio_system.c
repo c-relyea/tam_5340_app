@@ -246,7 +246,7 @@ static int tone_buf_set(uint32_t freq)
 
 	if (IS_ENABLED(CONFIG_AUDIO_TEST_TONE)) {
 		ret = tone_gen(test_tone_buf, &test_tone_size, freq, CONFIG_AUDIO_SAMPLE_RATE_HZ,
-			       1);
+			       1.0f / (1 << CONFIG_AUDIO_TEST_TONE_SHIFT));
 		ERR_CHK(ret);
 	} else {
 		LOG_ERR("Test tone is not enabled");

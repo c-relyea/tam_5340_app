@@ -74,12 +74,12 @@ const uint32_t pdm_mic_enable_configure[][2] = {
 	/* Volume Update */
 	{ CS47L63_INPUT_CONTROL3, 0x20000000 },
 
-	/* BIS 1 (left): sum Pod 1 trachea (IN1L) + Pod 2 trachea (IN2L) */
-	{ CS47L63_ASP1TX1_INPUT1, 0x800010 },
-	{ CS47L63_ASP1TX1_INPUT2, 0x800012 },
+	/* BIS 1 (left): Pod 1 ambient (IN1R) */
+	{ CS47L63_ASP1TX1_INPUT1, 0x800011 },
 
-	/* BIS 2 (right): Pod 1 ambient (IN1R) */
-	{ CS47L63_ASP1TX2_INPUT1, 0x800011 },
+	/* BIS 2 (right): sum Pod 1 trachea (IN1L) + Pod 2 trachea (IN2L) */
+	{ CS47L63_ASP1TX2_INPUT1, 0x800010 },
+	{ CS47L63_ASP1TX2_INPUT2, 0x800012 },
 };
 
 /* Set up input */

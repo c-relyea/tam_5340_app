@@ -167,6 +167,16 @@ config AUDIO_TEST_TONE_HZ
 	  in the test tone source. The tone buffer holds one period at
 	  100 Hz, so anything in range fits.
 
+config AUDIO_TEST_TONE_SHIFT
+	int "Test tone attenuation, in halvings"
+	depends on AUDIO_TEST_TONE
+	default 2
+	range 0 8
+	help
+	  The sine peak is INT16_MAX >> this. 0 is full scale, which the LC3
+	  round trip overshoots and the sink clips; 2 is about -12 dBFS,
+	  matching the noise source.
+
 config AUDIO_TEST_NOISE_SHIFT
 	int "White noise attenuation, in halvings"
 	depends on AUDIO_TEST_TONE

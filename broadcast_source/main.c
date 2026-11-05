@@ -701,7 +701,7 @@ K_THREAD_DEFINE(battery_thread_id, 1024, battery_thread, NULL, NULL, NULL, 13, 0
  * P,<uptime_ms>,<ir>,<red>,<green>
  * Capture with log_ppg.sh and filter lines starting with "P," (~100 lines/s).
  */
-#define PPG_RAW_LOG 0
+#define PPG_RAW_LOG 1
 
 /* -------------------------------------------------------------------------
  * PPG beacon payload

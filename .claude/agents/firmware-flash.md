@@ -11,6 +11,11 @@ Working directory: `/opt/nordic/ncs/v2.8.0/nrf/applications/tam_5340` — always
 
 ## Primary flow
 
+0. Load the NCS toolchain environment in the same shell command as west (shell state doesn't persist between calls). Without it, Homebrew's CMake 4.x wins on PATH and configure fails:
+   ```
+   . tools/ncs_env.sh && west build ...
+   ```
+   Verify with `cmake --version` → 3.21.0 if in doubt.
 1. Build:
    ```
    west build --pristine -b tam_board/nrf5340/cpuapp --sysbuild -- -DCONFIG_AUDIO_DEV=2
